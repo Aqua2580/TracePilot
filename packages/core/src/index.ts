@@ -11,6 +11,7 @@ export * from "./domain/task.js";
 export * from "./domain/evidence.js";
 export * from "./domain/repair-record.js";
 export * from "./domain/audit.js";
+export * from "./domain/agent-run.js";
 
 // 端口（仅接口 —— 实现在 packages/adapters、packages/store）
 export * from "./ports/adapters.js";

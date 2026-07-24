@@ -22,6 +22,7 @@ import type {
 } from "../domain/evidence.js";
 import type { RepairRecord } from "../domain/repair-record.js";
 import type { AuditEvent } from "../domain/audit.js";
+import type { AgentRunRecord } from "../domain/agent-run.js";
 import type { Worktree } from "../ports/adapters.js";
 import type {
   ProjectRepository,
@@ -33,6 +34,7 @@ import type {
   WorktreeRepository,
   RepairRecordRepository,
   AuditRepository,
+  AgentRunRepository,
   UnitOfWork,
   TransactionalRepos
 } from "../ports/repositories.js";
@@ -324,6 +326,24 @@ export class InMemoryAuditRepository implements AuditRepository {
   }
 }
 
+/**
+ * AgentRun 内存仓储 —— 仅追加，事务回滚时截断到事务前长度。
+ *
+ * 与 audit 一致：落库后只读，事务内 save 失败时丢弃本次新增。
+ */
+export class InMemoryAgentRunRepository implements AgentRunRepository {
+  constructor(private readonly table: AppendOnlySnapshotTable<AgentRunRecord>) {}
+  async save(record: AgentRunRecord): Promise<void> {
+    this.table.append(record);
+  }
+  async findByTask(taskId: string): Promise<AgentRunRecord[]> {
+    return this.table.all().filter((r) => r.taskId === taskId);
+  }
+  async findByRunId(taskId: string, runId: string): Promise<AgentRunRecord | undefined> {
+    return this.table.all().find((r) => r.taskId === taskId && r.runId === runId);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // UnitOfWork：串行队列 + 快照回滚
 // ---------------------------------------------------------------------------
@@ -405,10 +425,12 @@ export function createInMemoryStore(): InMemoryStore {
   const worktreesTable = new SnapshotTable<Worktree>();
   const repairRecordsTable = new SnapshotTable<RepairRecord>();
   const auditTable = new AppendOnlySnapshotTable<AuditEvent>();
+  const agentRunsTable = new AppendOnlySnapshotTable<AgentRunRecord>();
 
   const allTables: SnapshotCapable[] = [
     projectsTable, tasksTable, evidencePacksTable, evidenceRequestsTable,
-    plansTable, approvalsTable, worktreesTable, repairRecordsTable, auditTable
+    plansTable, approvalsTable, worktreesTable, repairRecordsTable, auditTable,
+    agentRunsTable
   ];
 
   const repos: TransactionalRepos = {
@@ -420,7 +442,8 @@ export function createInMemoryStore(): InMemoryStore {
     approvals: new InMemoryApprovalRepository(approvalsTable),
     worktrees: new InMemoryWorktreeRepository(worktreesTable),
     repairRecords: new InMemoryRepairRecordRepository(repairRecordsTable),
-    audit: new InMemoryAuditRepository(auditTable)
+    audit: new InMemoryAuditRepository(auditTable),
+    agentRuns: new InMemoryAgentRunRepository(agentRunsTable)
   };
 
   const tables: InMemoryTables = {

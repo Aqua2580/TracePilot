@@ -19,6 +19,7 @@ import type {
 } from "../domain/evidence.js";
 import type { RepairRecord } from "../domain/repair-record.js";
 import type { AuditEvent } from "../domain/audit.js";
+import type { AgentRunRecord } from "../domain/agent-run.js";
 import type { Worktree } from "./adapters.js";
 
 export interface ProjectRepository {
@@ -87,6 +88,19 @@ export interface AuditRepository {
 }
 
 /**
+ * AgentRun 持久化端口 —— Runtime 事件批量落库（§3.1、§7.3）。
+ *
+ * RuntimeEvent 先进入内存缓冲区，再通过此端口批量追加到 `agent_runs` 表。
+ * 落库时必须应用单条输出与单任务总日志大小上限，并保留截断摘要/哈希。
+ */
+export interface AgentRunRepository {
+  save(record: AgentRunRecord): Promise<void>;
+  findByTask(taskId: string): Promise<AgentRunRecord[]>;
+  /** 按 runId 查找单条记录（重启后回放/查询用）。 */
+  findByRunId(taskId: string, runId: string): Promise<AgentRunRecord | undefined>;
+}
+
+/**
  * 聚合 UnitOfWork 接口。orchestrator 通过此接口强制实施
  * §5.2 不变量：状态转换 + 审计事件必须在
  * 同一 DB 事务中写入。InMemory 实现以单个同步块运行；
@@ -112,4 +126,5 @@ export interface TransactionalRepos {
   readonly worktrees: WorktreeRepository;
   readonly repairRecords: RepairRecordRepository;
   readonly audit: AuditRepository;
+  readonly agentRuns: AgentRunRepository;
 }
