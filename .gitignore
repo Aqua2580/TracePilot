@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Test artifacts
+coverage/
+.vitest-cache/
+
+# TracePilot runtime data (must never be committed — see ADR-005)
+# Local SQLite database, worktrees, logs
+%LOCALAPPDATA%/TracePilot/
+tracepilot.db
+tracepilot.db-*
+*.db
+*.db-*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/

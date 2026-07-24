@@ -1,0 +1,27 @@
+{
+  "name": "@tracepilot/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "dev": "node --watch src/server.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "lint": "eslint src tests"
+  },
+  "dependencies": {
+    "@tracepilot/core": "workspace:*",
+    "@tracepilot/governance": "workspace:*",
+    "@tracepilot/adapters": "workspace:*",
+    "fastify": "^5.2.0",
+    "pino": "^9.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
