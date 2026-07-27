@@ -86,6 +86,15 @@ export interface Plan {
   readonly inputEvidencePackId: EvidencePackId;
   readonly inputEvidencePackVersion: EvidencePackVersion;
   readonly createdAt: string;
+  /**
+   * P1-R03：Plan 批准的允许路径白名单。
+   *
+   * 见规格 §8.1 步骤 4-5：Planner 输出线性计划时确定 allowedPaths，
+   * 并作为执行审批的范围快照组成部分（与 commandWhitelist、riskLevel
+   * 一起计算 scopeHash）。WorktreeManager.createAndAttachWorktree 必须
+   * 从 Plan 读取 allowedPaths，不得信任请求体提供的任意值。
+   */
+  readonly allowedPaths: readonly string[];
 }
 
 /**

@@ -12,13 +12,14 @@
 import type { Database as DatabaseType } from "better-sqlite3";
 import type { Project, ProjectCommands, CommandSpec } from "@tracepilot/core";
 import type { Task, TaskInput, TaskStatus, ApprovalRecord, Plan, PlanNode } from "@tracepilot/core";
-import type {
-  EvidencePack,
-  EvidenceItem,
-  Hypothesis,
-  EvidenceConstraint,
-  EvidenceRequest,
-  EvidenceKind
+import {
+  EvidencePackVersionError,
+  type EvidencePack,
+  type EvidenceItem,
+  type Hypothesis,
+  type EvidenceConstraint,
+  type EvidenceRequest,
+  type EvidenceKind
 } from "@tracepilot/core";
 import type { RepairRecord, VerificationSummary, ReviewSummary, ReviewFinding } from "@tracepilot/core";
 import type { AuditEvent, AuditEventType, OutputTruncation } from "@tracepilot/core";
@@ -259,15 +260,14 @@ class SqliteEvidencePackRepository implements EvidencePackRepository {
   constructor(private readonly db: DatabaseType) {}
 
   async save(pack: EvidencePack): Promise<void> {
-    this.db
+    // P1-04：Pack 按版本不可变（§5.3、AGENTS.md 规则 10）。
+    // 重复 (id, version) 必须拒绝，禁止 upsert 覆盖。
+    // 与 InMemory 仓储行为一致，抛出领域错误 EvidencePackVersionError。
+    const insert = this.db
       .prepare(
         `INSERT INTO evidence_packs (id, task_id, version, task_snapshot_json, evidence_json, hypotheses_json, constraints_json, acceptance_criteria_json, created_at, content_hash)
          VALUES (@id, @taskId, @version, @taskSnapshotJson, @evidenceJson, @hypothesesJson, @constraintsJson, @acceptanceCriteriaJson, @createdAt, @contentHash)
-         ON CONFLICT(id, version) DO UPDATE SET
-           evidence_json = @evidenceJson,
-           hypotheses_json = @hypothesesJson,
-           constraints_json = @constraintsJson,
-           acceptance_criteria_json = @acceptanceCriteriaJson`
+         ON CONFLICT(id, version) DO NOTHING`
       )
       .run({
         id: pack.id,
@@ -281,6 +281,11 @@ class SqliteEvidencePackRepository implements EvidencePackRepository {
         createdAt: pack.createdAt,
         contentHash: pack.contentHash
       });
+    if (insert.changes === 0) {
+      throw new EvidencePackVersionError(
+        `EvidencePack ${pack.id} 版本 ${pack.version} 已存在 —— Pack 按版本不可变。`
+      );
+    }
   }
 
   async findById(id: string): Promise<EvidencePack | undefined> {
@@ -410,12 +415,13 @@ class SqlitePlanRepository implements PlanRepository {
   async save(plan: Plan): Promise<void> {
     this.db
       .prepare(
-        `INSERT INTO plans (id, task_id, nodes_json, input_evidence_pack_id, input_evidence_pack_version, created_at)
-         VALUES (@id, @taskId, @nodesJson, @inputEvidencePackId, @inputEvidencePackVersion, @createdAt)
+        `INSERT INTO plans (id, task_id, nodes_json, input_evidence_pack_id, input_evidence_pack_version, created_at, allowed_paths_json)
+         VALUES (@id, @taskId, @nodesJson, @inputEvidencePackId, @inputEvidencePackVersion, @createdAt, @allowedPathsJson)
          ON CONFLICT(id) DO UPDATE SET
            nodes_json = @nodesJson,
            input_evidence_pack_id = @inputEvidencePackId,
-           input_evidence_pack_version = @inputEvidencePackVersion`
+           input_evidence_pack_version = @inputEvidencePackVersion,
+           allowed_paths_json = @allowedPathsJson`
       )
       .run({
         id: plan.id,
@@ -423,7 +429,8 @@ class SqlitePlanRepository implements PlanRepository {
         nodesJson: toJson(plan.nodes),
         inputEvidencePackId: plan.inputEvidencePackId,
         inputEvidencePackVersion: plan.inputEvidencePackVersion,
-        createdAt: plan.createdAt
+        createdAt: plan.createdAt,
+        allowedPathsJson: toJson(plan.allowedPaths)
       });
   }
 
@@ -449,6 +456,7 @@ interface PlanRow {
   input_evidence_pack_id: string;
   input_evidence_pack_version: number;
   created_at: string;
+  allowed_paths_json: string;
 }
 
 function planFromRow(row: PlanRow): Plan {
@@ -458,7 +466,8 @@ function planFromRow(row: PlanRow): Plan {
     nodes: parseJson<readonly PlanNode[]>(row.nodes_json),
     inputEvidencePackId: row.input_evidence_pack_id,
     inputEvidencePackVersion: row.input_evidence_pack_version,
-    createdAt: row.created_at
+    createdAt: row.created_at,
+    allowedPaths: parseJson<readonly string[]>(row.allowed_paths_json)
   };
 }
 

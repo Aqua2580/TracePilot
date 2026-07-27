@@ -25,6 +25,7 @@
   },
   "devDependencies": {
     "@tracepilot/adapters": "workspace:*",
+    "@tracepilot/governance": "workspace:*",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0",

@@ -23,3 +23,6 @@ export * from "./repositories/in-memory.js";
 
 // 服务
 export * from "./services/task-orchestrator.js";
+export * from "./services/evidence-router.js";
+export * from "./services/worktree-manager.js";
+export * from "./services/evidence-collector.js";

@@ -14,6 +14,7 @@ import type {
 import type { TaskInput } from "../domain/task.js";
 import type { RepairRecord } from "../domain/repair-record.js";
 import type { RepositoryInfo } from "../domain/project.js";
+import type { OutputTruncation } from "../domain/audit.js";
 
 // ---------------------------------------------------------------------------
 // GitAdapter — §6
@@ -63,12 +64,100 @@ export interface GitEvidence {
   readonly files: readonly string[];
 }
 
+/** Blame 查询参数 —— 见 §6、Phase 3 Git 证据采集。 */
+export interface BlameQuery {
+  readonly repositoryPath: string;
+  /** 相对仓库根的路径。 */
+  readonly path: string;
+  readonly startLine?: number;
+  readonly endLine?: number;
+}
+
+/** Blame 证据项 —— 每行（或连续行段）对应的提交与作者信息。 */
+export interface BlameEvidence {
+  readonly commitSha: string;
+  readonly author: string;
+  /** ISO 8601 时间戳。 */
+  readonly authoredAt: string;
+  /** [startLine, endLine] 闭区间。 */
+  readonly lineRange: readonly [number, number];
+  readonly lineContent: string;
+}
+
+/**
+ * 单条 git 命令的审计信息（P1-03）。
+ *
+ * 由 LocalGitAdapter 在每次执行 git 命令后通过 GitCommandAuditSink 上报。
+ * 应用/编排层消费这些信息，在同一 SQLite 真源追加结构化审计
+ * （§7.3：argv、cwd、退出码、输出截断信息）。
+ */
+export interface GitCommandAudit {
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  readonly exitCode: number;
+  readonly outputTruncation: OutputTruncation;
+}
+
+/**
+ * 命令审计收集器（P1-03）。
+ *
+ * LocalGitAdapter 在执行 git 命令后调用 `record` 上报审计信息。
+ * 调用方（WorktreeManager / EvidenceCollector）提供收集器实现，
+ * 在 git 操作完成后将收集到的审计写入 SQLite audit_events。
+ */
+export interface GitCommandAuditSink {
+  record(audit: GitCommandAudit): void;
+}
+
 export interface GitAdapter {
-  validateRepository(projectPath: string): Promise<RepositoryInfo>;
-  createWorktree(input: CreateWorktreeInput): Promise<Worktree>;
-  getDiff(worktreePath: string): Promise<DiffArtifact>;
-  getHistory(query: GitQuery): Promise<GitEvidence[]>;
-  removeRegisteredWorktree(worktree: Worktree): Promise<void>;
+  /**
+   * 校验仓库路径并返回仓库元信息。
+   * @param auditSink P1-03：可选的命令审计收集器。
+   */
+  validateRepository(
+    projectPath: string,
+    auditSink?: GitCommandAuditSink
+  ): Promise<RepositoryInfo>;
+  /**
+   * 创建受控 worktree。
+   * @param auditSink P1-03：可选的命令审计收集器。
+   */
+  createWorktree(
+    input: CreateWorktreeInput,
+    auditSink?: GitCommandAuditSink
+  ): Promise<Worktree>;
+  /**
+   * 获取 worktree 内的 diff 产物。
+   * @param auditSink P1-03：可选的命令审计收集器。
+   */
+  getDiff(
+    worktreePath: string,
+    auditSink?: GitCommandAuditSink
+  ): Promise<DiffArtifact>;
+  /**
+   * 查询仓库历史。
+   * @param auditSink P1-03：可选的命令审计收集器。
+   */
+  getHistory(
+    query: GitQuery,
+    auditSink?: GitCommandAuditSink
+  ): Promise<GitEvidence[]>;
+  /**
+   * 获取指定文件指定行段的 blame 信息（Phase 3）。
+   * @param auditSink P1-03：可选的命令审计收集器。
+   */
+  getBlame(
+    query: BlameQuery,
+    auditSink?: GitCommandAuditSink
+  ): Promise<BlameEvidence[]>;
+  /**
+   * 回收已登记的 worktree（受控清理）。
+   * @param auditSink P1-03：可选的命令审计收集器。
+   */
+  removeRegisteredWorktree(
+    worktree: Worktree,
+    auditSink?: GitCommandAuditSink
+  ): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import type {
   EvidencePack,
   EvidenceRequest
 } from "../domain/evidence.js";
+import { EvidencePackVersionError } from "../domain/evidence.js";
 import type { RepairRecord } from "../domain/repair-record.js";
 import type { AuditEvent } from "../domain/audit.js";
 import type { AgentRunRecord } from "../domain/agent-run.js";
@@ -215,6 +216,14 @@ export class InMemoryTaskRepository implements TaskRepository {
 export class InMemoryEvidencePackRepository implements EvidencePackRepository {
   constructor(private readonly table: VersionedSnapshotTable<EvidencePack>) {}
   async save(pack: EvidencePack): Promise<void> {
+    // 在 append 前检查重复版本，抛出领域错误 EvidencePackVersionError，
+    // 使 Pack 不可变约束在仓储层即可被调用方捕获。
+    const existing = this.table.list(pack.id);
+    if (existing.some((p) => p.version === pack.version)) {
+      throw new EvidencePackVersionError(
+        `EvidencePack ${pack.id} 版本 ${pack.version} 已存在 —— Pack 按版本不可变。`
+      );
+    }
     this.table.append(pack);
   }
   async findById(id: string): Promise<EvidencePack | undefined> {

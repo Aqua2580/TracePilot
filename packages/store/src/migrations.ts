@@ -192,6 +192,13 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE agent_runs ADD COLUMN retained_bytes INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE agent_runs ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
     `
+  },
+  {
+    version: 3,
+    description: "plans 增加 allowed_paths_json 列（P1-R03 Plan 持久化 allowedPaths 以支持执行审批 scopeHash 校验）",
+    sql: `
+      ALTER TABLE plans ADD COLUMN allowed_paths_json TEXT NOT NULL DEFAULT '[]';
+    `
   }
 ];
 

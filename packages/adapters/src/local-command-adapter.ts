@@ -170,19 +170,21 @@ export class LocalCommandAdapter implements RuntimeAdapter {
     const runId = randomId("run");
     this.runs.set(runId, { cancelled: false });
     yield { type: "started", runId, taskId: _input.taskId, at: new Date().toISOString() };
-    // MVP：develop 在流式事件之外是 no-op。Phase 4 经 omp 运行时（或在
-    // omp 仍不可用时用确定性规则补丁器）路由真实代码修改。
+    // Phase 3 仍未接 LLM：develop 在流式事件之外是 no-op。Phase 3 已落地
+    // 真实 LocalGitAdapter（worktree / diff / history / blame），但代码修改
+    // 仍由 Phase 4 经 omp 运行时（或在 omp 仍不可用时用确定性规则补丁器）
+    // 路由。在此之前 develop 不得声称完成真实修复。
     yield {
       type: "progress",
       runId,
-      message: "LocalCommandAdapter.develop 在 Phase 1 是 no-op；真实修改在 Phase 4 落地",
+      message: "LocalCommandAdapter.develop 在 Phase 3 仍是 no-op；真实代码修改由 Phase 4 落地",
       at: new Date().toISOString()
     };
     yield {
       type: "completed",
       runId,
       at: new Date().toISOString(),
-      summary: "no-op develop（Phase 1）"
+      summary: "no-op develop（Phase 3 仍未接 LLM）"
     };
   }
 

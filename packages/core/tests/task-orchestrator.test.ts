@@ -7,11 +7,16 @@ import {
   TerminalTaskError,
   ScopeMismatchError,
   InvalidApprovalStateError,
-  computeScopeHash,
   isApprovalInvalidated,
+  EvidencePackVersionError,
   type TaskInput,
   type TaskStatus,
   type EvidencePack,
+  type EvidenceItem,
+  type Worktree,
+  type Project,
+  type ProjectCommands,
+  type PlanNode,
   type InMemoryStore
 } from "../src/index.js";
 
@@ -52,22 +57,101 @@ function sampleEvidencePack(
   };
 }
 
+/** 构造最小可用 EvidenceItem，供 Pack 编排测试使用。 */
+function sampleEvidenceItem(overrides: Partial<EvidenceItem> = {}): EvidenceItem {
+  return {
+    id: "ev-1",
+    kind: "code",
+    source: "code-search",
+    locator: "src/users.ts:12",
+    capturedAt: "2026-07-27T00:00:00.000Z",
+    contentHash: "sha256-abc",
+    summary: "function createUser 返回 400 当输入为空",
+    relevance: 0.8,
+    trustLevel: "PRIMARY",
+    ...overrides
+  };
+}
+
+/** 构造最小可用 Worktree，供 attachWorktree 测试使用。 */
+function sampleWorktree(taskId: string, overrides: Partial<Worktree> = {}): Worktree {
+  return {
+    id: "wt-test-1",
+    projectId: "proj-1",
+    taskId,
+    path: "/tmp/tracepilot/worktrees/proj-1/task-wt",
+    branch: "tracepilot/task-wt",
+    baseCommitSha: "abc123def456",
+    allowedPaths: ["src/**"],
+    createdAt: "2026-07-27T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+/**
+ * P1-R04：测试用命令契约。computeScopeHash 必须包含完整 argv + timeoutMs，
+ * 因此测试需要构造完整的 ProjectCommands 而非命令 key 数组。
+ */
+const sampleCommands: ProjectCommands = {
+  test: { argv: ["pytest"], timeoutMs: 30000 }
+};
+
+/** 构造最小可用 Project，供 computeCurrentScopeHash 读取。 */
+function sampleProject(id = "proj-1"): Project {
+  return {
+    id,
+    name: "测试项目",
+    repositoryPath: "/tmp/tracepilot/repos/proj-1",
+    defaultBranch: "main",
+    language: "python",
+    commands: sampleCommands,
+    createdAt: "2026-01-01T00:00:00.000Z"
+  };
+}
+
+/**
+ * P1-R04：构造最小可用 PlanNode 数组，供 planTask 使用。
+ */
+function samplePlanNodes(packId: string): readonly PlanNode[] {
+  return [
+    {
+      id: "node-1",
+      label: "修改 users.py",
+      description: "调整 createUser 实现",
+      evidencePackId: packId,
+      evidencePackVersion: 1
+    }
+  ];
+}
+
 describe("TaskOrchestrator", () => {
   let store: InMemoryStore;
   let orchestrator: TaskOrchestrator;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     store = createInMemoryStore();
     orchestrator = new TaskOrchestrator({ unitOfWork: store.unitOfWork });
+    // P1-R04：computeCurrentScopeHash 需要从持久化的 Project 读取 commands，
+    // 因此测试前先持久化一个最小可用 Project。
+    await store.unitOfWork.run(async (tx) => {
+      await tx.projects.save(sampleProject());
+    });
   });
 
-  /** 把任务从 CREATED 一路迁移到目标状态（跳过审批闸门由调用方自理）。 */
+  /**
+   * 把任务从 CREATED 一路迁移到目标状态（跳过审批闸门由调用方自理）。
+   *
+   * P1-R03 / P1-R04 修正：moveTo 必须走完整合法时序：
+   * 1. CREATED → INTAKING → GATHERING_EVIDENCE
+   * 2. 生成 Pack v1（空 evidence，仅满足 Plan 引用）
+   * 3. GATHERING_EVIDENCE → PLANNED
+   * 4. planTask 记录 Plan（含 allowedPaths，更新 task.currentPlanId）
+   * 5. PLANNED → AWAITING_EXECUTION_APPROVAL
+   * 6. computeCurrentScopeHash 获取权威 scopeHash（从 Plan + Project.commands）
+   * 7. recordApproval 签发执行审批
+   * 8. beginExecutionIfApproved 进入 EXECUTING（事务内重算 scopeHash 比对）
+   */
   async function moveTo(taskId: string, target: TaskStatus): Promise<void> {
-    // 进入 EXECUTING 必须经 beginExecutionIfApproved（P1-R02），因此
-    // 到达 AWAITING_EXECUTION_APPROVAL 后签发一份执行审批再继续。
-    const preExec: readonly TaskStatus[] = [
-      "INTAKING", "GATHERING_EVIDENCE", "PLANNED", "AWAITING_EXECUTION_APPROVAL"
-    ];
     const execAndBeyond: Partial<Record<TaskStatus, readonly TaskStatus[]>> = {
       EXECUTING: ["EXECUTING"],
       EVIDENCE_GAP: ["EXECUTING", "EVIDENCE_GAP"],
@@ -76,30 +160,54 @@ describe("TaskOrchestrator", () => {
       AWAITING_HUMAN_APPROVAL: ["EXECUTING", "VALIDATING", "REVIEWING", "AWAITING_HUMAN_APPROVAL"]
     };
 
-    // 1. 走到目标或 AWAITING_EXECUTION_APPROVAL（取较早者）。
-    const preExecTargetIdx = preExec.indexOf(target);
-    const stopIdx = preExecTargetIdx >= 0 ? preExecTargetIdx : preExec.length - 1;
-    for (let i = 0; i <= stopIdx; i++) {
-      await orchestrator.transitionTask(taskId, preExec[i]!);
-    }
-    if (preExecTargetIdx >= 0) return; // 目标在 EXECUTING 之前
+    // 1. CREATED → INTAKING → GATHERING_EVIDENCE。
+    await orchestrator.transitionTask(taskId, "INTAKING");
+    await orchestrator.transitionTask(taskId, "GATHERING_EVIDENCE");
 
-    // 2. 签发执行审批并经 beginExecutionIfApproved 进入 EXECUTING。
-    const scope = computeScopeHash({
-      allowedPaths: ["src/**"],
-      commandWhitelist: ["pytest"],
-      riskLevel: "low"
+    // 2. 如果目标就是 GATHERING_EVIDENCE，停留在此（让调用方自行
+    //    决定何时调用 gatherEvidenceAndCreatePack）。
+    if (target === "GATHERING_EVIDENCE") return;
+
+    // 3. 生成 Pack v1（空 evidence，仅满足 Plan 引用）。
+    const packId = `pack-${taskId}`;
+    await orchestrator.gatherEvidenceAndCreatePack({
+      taskId,
+      packId,
+      evidence: [],
+      acceptanceCriteria: []
     });
+
+    // 4. GATHERING_EVIDENCE → PLANNED。
+    await orchestrator.transitionTask(taskId, "PLANNED");
+
+    // 5. 记录 Plan（含 allowedPaths，更新 task.currentPlanId）。
+    await orchestrator.planTask({
+      taskId,
+      nodes: samplePlanNodes(packId),
+      allowedPaths: ["src/**"],
+      inputEvidencePackId: packId,
+      inputEvidencePackVersion: 1
+    });
+
+    // 6. 如果目标就是 PLANNED，到此为止。
+    if (target === "PLANNED") return;
+
+    // 7. PLANNED → AWAITING_EXECUTION_APPROVAL。
+    await orchestrator.transitionTask(taskId, "AWAITING_EXECUTION_APPROVAL");
+    if (target === "AWAITING_EXECUTION_APPROVAL") return;
+
+    // 8. computeCurrentScopeHash + recordApproval + beginExecutionIfApproved。
+    const scopeHash = await orchestrator.computeCurrentScopeHash(taskId);
     await orchestrator.recordApproval({
       taskId,
       kind: "execution",
       approver: "mover",
       decision: "approved",
-      scopeHash: scope
+      scopeHash
     });
-    await orchestrator.beginExecutionIfApproved(taskId, scope);
+    await orchestrator.beginExecutionIfApproved(taskId);
 
-    // 3. 继续走 EXECUTING 之后的步骤（EXECUTING 本身已完成，跳过）。
+    // 9. 继续走 EXECUTING 之后的步骤。
     const tail = execAndBeyond[target]?.slice(1) ?? [];
     for (const s of tail) {
       await orchestrator.transitionTask(taskId, s);
@@ -130,17 +238,28 @@ describe("TaskOrchestrator", () => {
         input: sampleTaskInput()
       });
 
+      // P1-R03 / P1-R04：合法时序需要 Plan + execution approval 才能
+      // 经 beginExecutionIfApproved 进入 EXECUTING。本测试直接走完整
+      // 合法流程（与 moveTo 等价）以到达 AWAITING_HUMAN_APPROVAL。
       await orchestrator.transitionTask(task.id, "INTAKING");
       await orchestrator.transitionTask(task.id, "GATHERING_EVIDENCE");
-      await orchestrator.transitionTask(task.id, "PLANNED");
-      await orchestrator.transitionTask(task.id, "AWAITING_EXECUTION_APPROVAL");
-      // P1-R02：进入 EXECUTING 必须经 beginExecutionIfApproved，不得用
-      // 通用 transitionTask 接口。先签发执行审批，再校验 scopeHash 进入。
-      const scope = computeScopeHash({
-        allowedPaths: ["src/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
+      const packId = `pack-${task.id}`;
+      await orchestrator.gatherEvidenceAndCreatePack({
+        taskId: task.id,
+        packId,
+        evidence: [],
+        acceptanceCriteria: []
       });
+      await orchestrator.transitionTask(task.id, "PLANNED");
+      await orchestrator.planTask({
+        taskId: task.id,
+        nodes: samplePlanNodes(packId),
+        allowedPaths: ["src/**"],
+        inputEvidencePackId: packId,
+        inputEvidencePackVersion: 1
+      });
+      await orchestrator.transitionTask(task.id, "AWAITING_EXECUTION_APPROVAL");
+      const scope = await orchestrator.computeCurrentScopeHash(task.id);
       await orchestrator.recordApproval({
         taskId: task.id,
         kind: "execution",
@@ -148,7 +267,7 @@ describe("TaskOrchestrator", () => {
         decision: "approved",
         scopeHash: scope
       });
-      await orchestrator.beginExecutionIfApproved(task.id, scope);
+      await orchestrator.beginExecutionIfApproved(task.id);
       await orchestrator.transitionTask(task.id, "VALIDATING");
       await orchestrator.transitionTask(task.id, "REVIEWING");
       await orchestrator.transitionTask(task.id, "AWAITING_HUMAN_APPROVAL");
@@ -156,10 +275,13 @@ describe("TaskOrchestrator", () => {
       const final = await store.tasks.findById(task.id);
       expect(final?.status).toBe("AWAITING_HUMAN_APPROVAL");
 
-      // 1 条创建 + 4 条迁移到 AWAITING_EXECUTION_APPROVAL + 1 条执行审批 +
-      // 1 条进入 EXECUTING 迁移 + 3 条迁移到 AWAITING_HUMAN_APPROVAL = 10 条
+      // 1 条创建 +
+      // 2 条迁移到 GATHERING_EVIDENCE +
+      // 1 条 Pack v1 + 1 条迁移到 PLANNED + 1 条 plan_recorded +
+      // 1 条迁移到 AWAITING_EXECUTION_APPROVAL + 1 条执行审批 +
+      // 1 条进入 EXECUTING 迁移 + 3 条迁移到 AWAITING_HUMAN_APPROVAL = 12 条
       const audits = await store.audit.findByTask(task.id);
-      expect(audits).toHaveLength(10);
+      expect(audits).toHaveLength(12);
     });
 
     it("跳过闸门时抛 IllegalTransitionError", async () => {
@@ -357,11 +479,7 @@ describe("TaskOrchestrator", () => {
         input: sampleTaskInput()
       });
       await moveTo(task.id, "AWAITING_EXECUTION_APPROVAL");
-      const scopeHash = computeScopeHash({
-        allowedPaths: ["src/users/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
-      });
+      const scopeHash = await orchestrator.computeCurrentScopeHash(task.id);
 
       const approval = await orchestrator.recordApproval({
         taskId: task.id,
@@ -432,11 +550,7 @@ describe("TaskOrchestrator", () => {
         input: sampleTaskInput()
       });
       await moveTo(task.id, "AWAITING_EXECUTION_APPROVAL");
-      const scopeHash = computeScopeHash({
-        allowedPaths: ["src/users/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
-      });
+      const scopeHash = await orchestrator.computeCurrentScopeHash(task.id);
       await orchestrator.recordApproval({
         taskId: task.id,
         kind: "execution",
@@ -446,7 +560,7 @@ describe("TaskOrchestrator", () => {
       });
 
       // scopeHash 一致 → 可进入 EXECUTING
-      const executing = await orchestrator.beginExecutionIfApproved(task.id, scopeHash);
+      const executing = await orchestrator.beginExecutionIfApproved(task.id);
       expect(executing.status).toBe("EXECUTING");
 
       // 旧审批未失效
@@ -461,11 +575,7 @@ describe("TaskOrchestrator", () => {
         input: sampleTaskInput()
       });
       await moveTo(task.id, "AWAITING_EXECUTION_APPROVAL");
-      const oldScope = computeScopeHash({
-        allowedPaths: ["src/users/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
-      });
+      const oldScope = await orchestrator.computeCurrentScopeHash(task.id);
       await orchestrator.recordApproval({
         taskId: task.id,
         kind: "execution",
@@ -475,7 +585,7 @@ describe("TaskOrchestrator", () => {
       });
 
       // 进入 EXECUTING，遇到 EVIDENCE_GAP，扩大范围回到 GATHERING_EVIDENCE
-      await orchestrator.beginExecutionIfApproved(task.id, oldScope);
+      await orchestrator.beginExecutionIfApproved(task.id);
       await orchestrator.transitionTask(task.id, "EVIDENCE_GAP");
       await orchestrator.transitionTask(task.id, "GATHERING_EVIDENCE", {
         widenScope: true,
@@ -501,11 +611,7 @@ describe("TaskOrchestrator", () => {
         input: sampleTaskInput()
       });
       await moveTo(task.id, "AWAITING_EXECUTION_APPROVAL");
-      const oldScope = computeScopeHash({
-        allowedPaths: ["src/users/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
-      });
+      const oldScope = await orchestrator.computeCurrentScopeHash(task.id);
       await orchestrator.recordApproval({
         taskId: task.id,
         kind: "execution",
@@ -513,7 +619,7 @@ describe("TaskOrchestrator", () => {
         decision: "approved",
         scopeHash: oldScope
       });
-      await orchestrator.beginExecutionIfApproved(task.id, oldScope);
+      await orchestrator.beginExecutionIfApproved(task.id);
       await orchestrator.transitionTask(task.id, "EVIDENCE_GAP");
       await orchestrator.transitionTask(task.id, "GATHERING_EVIDENCE", {
         widenScope: true,
@@ -523,15 +629,9 @@ describe("TaskOrchestrator", () => {
       await orchestrator.transitionTask(task.id, "PLANNED");
       await orchestrator.transitionTask(task.id, "AWAITING_EXECUTION_APPROVAL");
 
-      const newScope = computeScopeHash({
-        allowedPaths: ["src/users/**", "src/auth/**"],
-        commandWhitelist: ["pytest", "ruff"],
-        riskLevel: "medium"
-      });
-
       // 旧审批已失效，新审批未签发 → 拒绝进入 EXECUTING
       await expect(
-        orchestrator.beginExecutionIfApproved(task.id, newScope)
+        orchestrator.beginExecutionIfApproved(task.id)
       ).rejects.toBeInstanceOf(ScopeMismatchError);
     });
 
@@ -541,11 +641,7 @@ describe("TaskOrchestrator", () => {
         input: sampleTaskInput()
       });
       await moveTo(task.id, "AWAITING_EXECUTION_APPROVAL");
-      const approvedScope = computeScopeHash({
-        allowedPaths: ["src/users/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
-      });
+      const approvedScope = await orchestrator.computeCurrentScopeHash(task.id);
       await orchestrator.recordApproval({
         taskId: task.id,
         kind: "execution",
@@ -554,14 +650,19 @@ describe("TaskOrchestrator", () => {
         scopeHash: approvedScope
       });
 
-      const differentScope = computeScopeHash({
-        allowedPaths: ["src/users/**", "src/auth/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
+      // P1-R04：修改 Project.commands（替换同名命令 argv）使 scopeHash 不一致。
+      // 旧实现只哈希命令 key，这种修改不会被检测到；新实现必须检测。
+      await store.unitOfWork.run(async (tx) => {
+        await tx.projects.save({
+          ...sampleProject(),
+          commands: {
+            test: { argv: ["python", "-m", "pytest"], timeoutMs: 60000 }
+          }
+        });
       });
 
       await expect(
-        orchestrator.beginExecutionIfApproved(task.id, differentScope)
+        orchestrator.beginExecutionIfApproved(task.id)
       ).rejects.toBeInstanceOf(ScopeMismatchError);
     });
 
@@ -571,11 +672,7 @@ describe("TaskOrchestrator", () => {
         input: sampleTaskInput()
       });
       await moveTo(task.id, "AWAITING_EXECUTION_APPROVAL");
-      const oldScope = computeScopeHash({
-        allowedPaths: ["src/users/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
-      });
+      const oldScope = await orchestrator.computeCurrentScopeHash(task.id);
       await orchestrator.recordApproval({
         taskId: task.id,
         kind: "execution",
@@ -583,19 +680,23 @@ describe("TaskOrchestrator", () => {
         decision: "approved",
         scopeHash: oldScope
       });
-      await orchestrator.beginExecutionIfApproved(task.id, oldScope);
+      await orchestrator.beginExecutionIfApproved(task.id);
       await orchestrator.transitionTask(task.id, "EVIDENCE_GAP");
       await orchestrator.transitionTask(task.id, "GATHERING_EVIDENCE", {
         widenScope: true,
         reason: "扩大范围"
       });
       await orchestrator.transitionTask(task.id, "PLANNED");
-      await orchestrator.transitionTask(task.id, "AWAITING_EXECUTION_APPROVAL");
-      const newScope = computeScopeHash({
-        allowedPaths: ["src/users/**", "src/auth/**"],
-        commandWhitelist: ["pytest", "ruff"],
-        riskLevel: "medium"
+      // P1-R04：扩大范围需要记录新 Plan（含扩展的 allowedPaths）。
+      await orchestrator.planTask({
+        taskId: task.id,
+        nodes: samplePlanNodes(`pack-${task.id}`),
+        allowedPaths: ["src/**", "tests/**"],
+        inputEvidencePackId: `pack-${task.id}`,
+        inputEvidencePackVersion: 1
       });
+      await orchestrator.transitionTask(task.id, "AWAITING_EXECUTION_APPROVAL");
+      const newScope = await orchestrator.computeCurrentScopeHash(task.id);
       await orchestrator.recordApproval({
         taskId: task.id,
         kind: "execution",
@@ -613,7 +714,7 @@ describe("TaskOrchestrator", () => {
       ).toHaveLength(2);
 
       // 新批准生效后可进入 EXECUTING
-      const executing = await orchestrator.beginExecutionIfApproved(task.id, newScope);
+      const executing = await orchestrator.beginExecutionIfApproved(task.id);
       expect(executing.status).toBe("EXECUTING");
     });
   });
@@ -648,14 +749,9 @@ describe("TaskOrchestrator", () => {
       });
       await moveTo(task.id, "AWAITING_EXECUTION_APPROVAL");
       // 不签发任何审批记录，直接尝试进入 EXECUTING。
-      const scope = computeScopeHash({
-        allowedPaths: ["src/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
-      });
 
       await expect(
-        orchestrator.beginExecutionIfApproved(task.id, scope)
+        orchestrator.beginExecutionIfApproved(task.id)
       ).rejects.toBeInstanceOf(ScopeMismatchError);
 
       const unchanged = await store.tasks.findById(task.id);
@@ -668,11 +764,7 @@ describe("TaskOrchestrator", () => {
         input: sampleTaskInput()
       });
       await moveTo(task.id, "AWAITING_EXECUTION_APPROVAL");
-      const scope = computeScopeHash({
-        allowedPaths: ["src/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
-      });
+      const scope = await orchestrator.computeCurrentScopeHash(task.id);
       // 签发一份被拒绝的执行审批。
       await orchestrator.recordApproval({
         taskId: task.id,
@@ -686,7 +778,7 @@ describe("TaskOrchestrator", () => {
       // findLatestExecutionApproval 仅返回 decision=approved 且未失效的记录，
       // 因此被拒绝的审批不构成有效批准 —— 进入 EXECUTING 被拒绝。
       await expect(
-        orchestrator.beginExecutionIfApproved(task.id, scope)
+        orchestrator.beginExecutionIfApproved(task.id)
       ).rejects.toBeInstanceOf(ScopeMismatchError);
 
       const unchanged = await store.tasks.findById(task.id);
@@ -699,11 +791,7 @@ describe("TaskOrchestrator", () => {
         input: sampleTaskInput()
       });
       await moveTo(task.id, "AWAITING_EXECUTION_APPROVAL");
-      const oldScope = computeScopeHash({
-        allowedPaths: ["src/users/**"],
-        commandWhitelist: ["pytest"],
-        riskLevel: "low"
-      });
+      const oldScope = await orchestrator.computeCurrentScopeHash(task.id);
       await orchestrator.recordApproval({
         taskId: task.id,
         kind: "execution",
@@ -713,22 +801,30 @@ describe("TaskOrchestrator", () => {
       });
       // 进入 EXECUTING → EVIDENCE_GAP → 扩大范围回 GATHERING_EVIDENCE，
       // 旧审批在同一事务内失效。
-      await orchestrator.beginExecutionIfApproved(task.id, oldScope);
+      await orchestrator.beginExecutionIfApproved(task.id);
       await orchestrator.transitionTask(task.id, "EVIDENCE_GAP");
       await orchestrator.transitionTask(task.id, "GATHERING_EVIDENCE", {
         widenScope: true,
         reason: "扩大范围"
       });
       await orchestrator.transitionTask(task.id, "PLANNED");
+      // P1-R04：扩大范围需要记录新 Plan。
+      await orchestrator.planTask({
+        taskId: task.id,
+        nodes: samplePlanNodes(`pack-${task.id}`),
+        allowedPaths: ["src/**", "tests/**"],
+        inputEvidencePackId: `pack-${task.id}`,
+        inputEvidencePackVersion: 1
+      });
       await orchestrator.transitionTask(task.id, "AWAITING_EXECUTION_APPROVAL");
 
       // 旧审批已失效，findLatestExecutionApproval 返回 undefined。
       const latest = await store.approvals.findLatestExecutionApproval(task.id);
       expect(latest).toBeUndefined();
 
-      // 即使传入与旧审批一致的 scopeHash，也因无有效审批被拒绝。
+      // 即使 scopeHash 与旧审批一致，也因无有效审批被拒绝。
       await expect(
-        orchestrator.beginExecutionIfApproved(task.id, oldScope)
+        orchestrator.beginExecutionIfApproved(task.id)
       ).rejects.toBeInstanceOf(ScopeMismatchError);
 
       const unchanged = await store.tasks.findById(task.id);
@@ -963,6 +1059,250 @@ describe("TaskOrchestrator", () => {
       expect(versions.map((v) => v.version)).toEqual([1, 2]);
       const latest = await store.evidencePacks.findLatestVersion(packId);
       expect(latest?.version).toBe(2);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Phase 3：证据 / Pack / worktree 编排方法（§5.3、§8.1 步骤 3-5）
+  // ---------------------------------------------------------------------
+  describe("Phase 3 gatherEvidenceAndCreatePack", () => {
+    it("在 GATHERING_EVIDENCE 状态下生成 Pack v1，事务原子更新 task 与审计", async () => {
+      const task = await orchestrator.createTask({
+        projectId: "proj-1",
+        input: sampleTaskInput()
+      });
+      await moveTo(task.id, "GATHERING_EVIDENCE");
+
+      const pack = await orchestrator.gatherEvidenceAndCreatePack({
+        taskId: task.id,
+        packId: "pack-phase3-1",
+        evidence: [sampleEvidenceItem()],
+        hypotheses: [
+          { text: "createUser 未校验空输入", confidence: 0.7, evidenceIds: ["ev-1"] }
+        ],
+        acceptanceCriteria: ["pytest tests/test_users.py 通过"]
+      });
+
+      // Pack v1 已持久化
+      expect(pack.version).toBe(1);
+      expect(pack.id).toBe("pack-phase3-1");
+      const stored = await store.evidencePacks.findById("pack-phase3-1");
+      expect(stored).toBeDefined();
+      expect(stored?.version).toBe(1);
+
+      // task.currentEvidencePackId / Version 被更新
+      const updatedTask = await store.tasks.findById(task.id);
+      expect(updatedTask?.currentEvidencePackId).toBe("pack-phase3-1");
+      expect(updatedTask?.currentEvidencePackVersion).toBe(1);
+
+      // evidence_pack_versioned 审计事件被写入
+      const audits = await store.audit.findByTask(task.id);
+      const packAudit = audits.find((a) => a.type === "evidence_pack_versioned");
+      expect(packAudit).toBeDefined();
+      expect(packAudit?.evidencePackId).toBe("pack-phase3-1");
+      expect(packAudit?.evidencePackVersion).toBe(1);
+      expect(packAudit?.evidencePackHash).toBe(pack.contentHash);
+      expect(packAudit?.reason).toContain("v1");
+    });
+
+    it("在非 GATHERING_EVIDENCE 状态下抛 IllegalTransitionError", async () => {
+      const task = await orchestrator.createTask({
+        projectId: "proj-1",
+        input: sampleTaskInput()
+      });
+      // 任务处于 CREATED 状态
+      await expect(
+        orchestrator.gatherEvidenceAndCreatePack({
+          taskId: task.id,
+          packId: "pack-illegal",
+          evidence: []
+        })
+      ).rejects.toBeInstanceOf(IllegalTransitionError);
+
+      // 任务保持原状态，Pack 未被持久化
+      const unchanged = await store.tasks.findById(task.id);
+      expect(unchanged?.status).toBe("CREATED");
+      const pack = await store.evidencePacks.findById("pack-illegal");
+      expect(pack).toBeUndefined();
+    });
+  });
+
+  describe("Phase 3 evolvePackWithNewEvidence", () => {
+    it("基于上一版本生成 v2，旧版本保留（findVersions 返回 [v1, v2]）", async () => {
+      const task = await orchestrator.createTask({
+        projectId: "proj-1",
+        input: sampleTaskInput()
+      });
+      await moveTo(task.id, "GATHERING_EVIDENCE");
+
+      // 1. 生成 Pack v1
+      await orchestrator.gatherEvidenceAndCreatePack({
+        taskId: task.id,
+        packId: "pack-evolve-1",
+        evidence: [sampleEvidenceItem()],
+        acceptanceCriteria: ["pytest tests/test_users.py 通过"]
+      });
+
+      // 2. 提交 EvidenceRequest（任务保持在 GATHERING_EVIDENCE）
+      const req = await orchestrator.submitEvidenceRequest({
+        taskId: task.id,
+        requesterRole: "planner",
+        gapReason: "需要 git blame 证据确认回归提交",
+        neededKinds: ["git"],
+        allowedScope: "仓库历史",
+        expectedPlanImpact: "补充回归假设"
+      });
+
+      // 3. 基于 request 升级 Pack
+      const newPack = await orchestrator.evolvePackWithNewEvidence({
+        taskId: task.id,
+        requestId: req.id,
+        additions: {
+          evidence: [sampleEvidenceItem({ id: "ev-2", kind: "git", source: "git-history" })],
+          hypotheses: [
+            { text: "commit abc 引入回归", confidence: 0.6, evidenceIds: ["ev-2"] }
+          ]
+        }
+      });
+
+      // v2 已生成
+      expect(newPack.version).toBe(2);
+      expect(newPack.evidence).toHaveLength(2);
+
+      // 旧版本保留
+      const versions = await store.evidencePacks.findVersions("pack-evolve-1");
+      expect(versions.map((v) => v.version)).toEqual([1, 2]);
+
+      // task.currentEvidencePackVersion 更新为 2
+      const updatedTask = await store.tasks.findById(task.id);
+      expect(updatedTask?.currentEvidencePackVersion).toBe(2);
+
+      // 审计事件记录版本升级
+      const audits = await store.audit.findByTask(task.id);
+      const versionedAudits = audits.filter((a) => a.type === "evidence_pack_versioned");
+      expect(versionedAudits).toHaveLength(2);
+      const v2Audit = versionedAudits.find((a) => a.evidencePackVersion === 2);
+      expect(v2Audit).toBeDefined();
+      expect(v2Audit?.reason).toContain("升级");
+    });
+  });
+
+  describe("Phase 3 Pack 不可变约束", () => {
+    it("直接对同一 id+version 二次 save 抛 EvidencePackVersionError", async () => {
+      const packId = "pack-immutable-test";
+      const v1 = sampleEvidencePack(packId, 1, "task-immutable");
+
+      // 第一次 save 成功
+      await store.evidencePacks.save(v1);
+
+      // 第二次 save 同一版本抛 EvidencePackVersionError
+      await expect(store.evidencePacks.save(v1)).rejects.toBeInstanceOf(
+        EvidencePackVersionError
+      );
+    });
+  });
+
+  describe("Phase 3 attachWorktree", () => {
+    it("写 task.worktreeId 并追加 worktree_created 审计事件", async () => {
+      const task = await orchestrator.createTask({
+        projectId: "proj-1",
+        input: sampleTaskInput()
+      });
+      const wt = sampleWorktree(task.id);
+
+      const updated = await orchestrator.attachWorktree(task.id, wt);
+
+      expect(updated.worktreeId).toBe("wt-test-1");
+
+      const stored = await store.tasks.findById(task.id);
+      expect(stored?.worktreeId).toBe("wt-test-1");
+
+      const audits = await store.audit.findByTask(task.id);
+      const wtAudit = audits.find((a) => a.type === "worktree_created");
+      expect(wtAudit).toBeDefined();
+      expect(wtAudit?.reason).toContain("worktree");
+    });
+
+    it("任务不存在时抛 TaskNotFoundError", async () => {
+      const wt = sampleWorktree("nope");
+      await expect(
+        orchestrator.attachWorktree("nope", wt)
+      ).rejects.toBeInstanceOf(TaskNotFoundError);
+    });
+  });
+
+  describe("Phase 3 submitEvidenceRequest", () => {
+    it("在 EXECUTING 状态下迁移到 EVIDENCE_GAP 并写 evidence_request_submitted 审计", async () => {
+      const task = await orchestrator.createTask({
+        projectId: "proj-1",
+        input: sampleTaskInput()
+      });
+      await moveTo(task.id, "EXECUTING");
+
+      const req = await orchestrator.submitEvidenceRequest({
+        taskId: task.id,
+        requesterRole: "developer",
+        gapReason: "执行时发现缺少 runtime 堆栈证据",
+        neededKinds: ["runtime"],
+        allowedScope: "运行测试捕获堆栈",
+        expectedPlanImpact: "需要补充运行时证据后调整修改方案"
+      });
+
+      expect(req.requesterRole).toBe("developer");
+      expect(req.gapReason).toContain("runtime");
+
+      // 任务迁移到 EVIDENCE_GAP
+      const updated = await store.tasks.findById(task.id);
+      expect(updated?.status).toBe("EVIDENCE_GAP");
+
+      // 审计事件记录迁移与原因
+      const audits = await store.audit.findByTask(task.id);
+      const submitAudit = audits.find((a) => a.type === "evidence_request_submitted");
+      expect(submitAudit).toBeDefined();
+      expect(submitAudit?.fromStatus).toBe("EXECUTING");
+      expect(submitAudit?.toStatus).toBe("EVIDENCE_GAP");
+      expect(submitAudit?.reason).toBe(req.gapReason);
+    });
+
+    it("在 GATHERING_EVIDENCE 状态下保持原状态", async () => {
+      const task = await orchestrator.createTask({
+        projectId: "proj-1",
+        input: sampleTaskInput()
+      });
+      await moveTo(task.id, "GATHERING_EVIDENCE");
+
+      await orchestrator.submitEvidenceRequest({
+        taskId: task.id,
+        requesterRole: "planner",
+        gapReason: "需要更多 code 证据",
+        neededKinds: ["code"],
+        allowedScope: "worktree 内代码",
+        expectedPlanImpact: "补充代码证据后细化计划"
+      });
+
+      // 任务保持 GATHERING_EVIDENCE
+      const updated = await store.tasks.findById(task.id);
+      expect(updated?.status).toBe("GATHERING_EVIDENCE");
+
+      // 审计事件仍被写入
+      const audits = await store.audit.findByTask(task.id);
+      const submitAudit = audits.find((a) => a.type === "evidence_request_submitted");
+      expect(submitAudit).toBeDefined();
+      expect(submitAudit?.fromStatus).toBe("GATHERING_EVIDENCE");
+      expect(submitAudit?.toStatus).toBe("GATHERING_EVIDENCE");
+    });
+
+    it("任务不存在时抛 TaskNotFoundError", async () => {
+      await expect(
+        orchestrator.submitEvidenceRequest({
+          taskId: "nope",
+          requesterRole: "planner",
+          gapReason: "无",
+          neededKinds: ["code"],
+          allowedScope: "无",
+          expectedPlanImpact: "无"
+        })
+      ).rejects.toBeInstanceOf(TaskNotFoundError);
     });
   });
 });

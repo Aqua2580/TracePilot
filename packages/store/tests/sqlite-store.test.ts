@@ -120,8 +120,8 @@ describe("SQLite 迁移", () => {
   it("首次打开数据库时应用所有迁移，版本号正确", () => {
     const db = openDatabase({ dbPath });
     const versions = getAppliedVersions(db);
-    expect(versions).toEqual([1, 2]);
-    expect(getLatestMigrationVersion()).toBe(2);
+    expect(versions).toEqual([1, 2, 3]);
+    expect(getLatestMigrationVersion()).toBe(3);
     closeDatabase(db);
   });
 
@@ -131,7 +131,7 @@ describe("SQLite 迁移", () => {
 
     const db2 = openDatabase({ dbPath });
     const versions = getAppliedVersions(db2);
-    expect(versions).toEqual([1, 2]);
+    expect(versions).toEqual([1, 2, 3]);
     closeDatabase(db2);
   });
 

@@ -7,6 +7,7 @@
  * Phase 2 将落地契约测试；Phase 1 仅交付 fake 适配器本身。
  */
 
+import { isAbsolute } from "node:path";
 import { randomId } from "@tracepilot/core";
 import type {
   RuntimeAdapter,
@@ -24,6 +25,8 @@ import type {
   DiffArtifact,
   GitQuery,
   GitEvidence,
+  BlameQuery,
+  BlameEvidence,
   CommandSpec,
   ProcessRunner,
   ProcessPolicy,
@@ -178,8 +181,14 @@ export class FakeKnowledgeAdapter implements KnowledgeAdapter {
 export class FakeGitAdapter implements GitAdapter {
   private readonly worktrees = new Map<string, Worktree>();
   private readonly diffPatches = new Map<string, string>();
+  private readonly historyMap = new Map<string, GitEvidence[]>();
+  private readonly blameMap = new Map<string, BlameEvidence[]>();
+  private repositoryInfoOverride: RepositoryInfo | undefined;
 
   async validateRepository(projectPath: string): Promise<RepositoryInfo> {
+    if (this.repositoryInfoOverride) {
+      return this.repositoryInfoOverride;
+    }
     return {
       repositoryPath: projectPath,
       defaultBranch: "main",
@@ -188,6 +197,10 @@ export class FakeGitAdapter implements GitAdapter {
     };
   }
   async createWorktree(input: CreateWorktreeInput): Promise<Worktree> {
+    // 校验 taskId 不含路径穿越片段，与 LocalGitAdapter 保持一致
+    if (input.taskId.includes("..") || isAbsolute(input.taskId)) {
+      throw new Error(`taskId 含非法路径片段: ${input.taskId}`);
+    }
     const wt: Worktree = {
       id: randomId("wt"),
       projectId: input.projectId,
@@ -211,15 +224,49 @@ export class FakeGitAdapter implements GitAdapter {
       bytes: patch.length
     };
   }
-  async getHistory(_query: GitQuery): Promise<GitEvidence[]> {
-    return [];
+  async getHistory(query: GitQuery): Promise<GitEvidence[]> {
+    // 优先返回通过 setHistory 注入的数据；未注入时返回空数组。
+    // 先按 repositoryPath 精确匹配，再回退到 setHistory 默认键（""）。
+    const key = query.repositoryPath;
+    return this.historyMap.get(key) ?? this.historyMap.get("") ?? [];
+  }
+  async getBlame(query: BlameQuery): Promise<BlameEvidence[]> {
+    // 优先返回通过 setBlame 注入的数据；未注入时返回确定性结构。
+    const injected = this.blameMap.get(query.path);
+    if (injected) return injected;
+    return [
+      {
+        commitSha: "fake-sha-0001",
+        author: "Fake Author",
+        authoredAt: "2026-01-01T00:00:00.000Z",
+        lineRange: [1, 1],
+        lineContent: "fake line content"
+      }
+    ];
   }
   async removeRegisteredWorktree(worktree: Worktree): Promise<void> {
+    // 校验 worktree 已登记，与 LocalGitAdapter 的受控根目录校验对齐
+    if (!this.worktrees.has(worktree.id)) {
+      throw new Error(`worktree 未登记，无法回收: ${worktree.id}`);
+    }
     this.worktrees.delete(worktree.id);
   }
   /** 仅用于测试的辅助方法，用于控制 getDiff 输出。 */
   setDiff(worktreePath: string, patch: string): void {
     this.diffPatches.set(worktreePath, patch);
+  }
+  /** 仅用于测试的辅助方法，注入 getHistory 返回的数据。 */
+  setHistory(history: GitEvidence[]): void {
+    // 用空字符串键作为默认 repositoryPath 的占位，匹配任意未指定路径的查询。
+    this.historyMap.set("", history);
+  }
+  /** 仅用于测试的辅助方法，按 path 注入 getBlame 返回的数据。 */
+  setBlame(path: string, blame: BlameEvidence[]): void {
+    this.blameMap.set(path, blame);
+  }
+  /** 仅用于测试的辅助方法，覆盖 validateRepository 返回的 RepositoryInfo。 */
+  setRepositoryInfo(info: RepositoryInfo): void {
+    this.repositoryInfoOverride = info;
   }
 }
 

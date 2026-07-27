@@ -19,3 +19,4 @@
 13. Phase 2 已于 2026-07-24 经独立 Reviewer 验收通过。进入 Phase 3 前必须阅读 `docs/reviews/PHASE-2-ACCEPTANCE-REVIEW.md`；若改动 SQLite 运行时、迁移、单写入队列、API 组合根或固定基准闭环，必须补齐回归测试并重新独立复核。
 14. **实现与验收必须职责分离。** 实现 Agent 可以运行测试并提交自测证据，但不得自行把验收报告改为“通过”、自行关闭 P1/P2，或批准自己实现的代码。阶段验收只能由未参与该实现的独立 Reviewer Agent 在重新阅读规格、验收报告和代码后完成；Reviewer 必须独立运行规定命令并记录结论与未解决问题。
 15. **Node 运行时版本要求 ≥ 22（推荐 24 LTS）。** `engines.node` 声明 `>=22.0.0`，`pnpm-workspace.yaml` 启用 `engineStrict: true` 确保下限检查，根目录 `.nvmrc` 固定 `24`。原因：`better-sqlite3@12` 通过 `prebuild-install` 提供 Node 22 (ABI 127) 与 Node 24 (ABI 137) 的预编译二进制。变更 Node 主版本前必须确认 `better-sqlite3` 提供对应 ABI 的预编译包，并验证原生依赖在干净安装后可加载。
+16. Phase 3 已于 2026-07-27 经独立 Reviewer 验收通过。进入 Phase 4 前必须阅读 `docs/reviews/PHASE-3-ACCEPTANCE-REVIEW.md`；若改动外置已登记 worktree、项目仓库根/受控 worktree 根分离、执行审批范围哈希、Git 审计或 Evidence Pack 不可变性边界，必须补齐回归与对抗性测试并重新独立复核。

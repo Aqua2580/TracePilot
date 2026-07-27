@@ -244,8 +244,10 @@ async function runBenchmarkChain(
     }
   ];
 
+  // P1-04：pack id 必须随 taskId 变化，否则重复执行会因 Pack 按版本不可变
+  // 而抛 EvidencePackVersionError（同 (id, version) 拒绝 upsert）。
   const packPayload = {
-    id: `pack-${fixture.id}`,
+    id: `pack-${taskId}`,
     taskId,
     version: 1 as const,
     taskSnapshot: fixture.taskInput,
@@ -407,7 +409,7 @@ describe("Fake Adapter 基准任务闭环", () => {
         expect(result.memoryRecordIds).toEqual([`mem-${fixture.id}`]);
       });
 
-      it("相同输入重复执行产出相同结构（Pack contentHash 一致，Fake Adapter 均被调用）", async () => {
+      it("相同输入重复执行产出相同结构（Fake Adapter 均被调用）", async () => {
         const chain1 = newChain(store, fixture);
         const chain2 = newChain(store, fixture);
         const r1 = await runBenchmarkChain(store, fixture, `${fixture.id}-rep1`, chain1);
@@ -417,7 +419,8 @@ describe("Fake Adapter 基准任务闭环", () => {
         expect(r1.evidenceCount).toBe(r2.evidenceCount);
         expect(r1.evidenceSources).toEqual(r2.evidenceSources);
         expect(r1.planNodeCount).toBe(r2.planNodeCount);
-        expect(r1.packContentHash).toBe(r2.packContentHash);
+        // P1-04：pack id 现在随 taskId 变化（避免同 (id, version) 冲突），
+        // 因此 contentHash 不再要求一致；结构等价性由其余字段断言。
         expect(r1.auditCount).toBe(r2.auditCount);
         expect(r1.auditTypes).toEqual(r2.auditTypes);
 

@@ -109,8 +109,11 @@ export function nextPackVersion(
   const constraints = additions.constraints
     ? [...previous.constraints, ...additions.constraints]
     : previous.constraints;
-  const acceptanceCriteria =
-    additions.acceptanceCriteria ?? previous.acceptanceCriteria;
+  // Pack 升级时新验收标准追加到旧列表后，旧标准仍需保留以满足审计回溯
+  // （§5.3 Pack 按版本不可变；新版本继承并扩展旧版本的所有字段）。
+  const acceptanceCriteria = additions.acceptanceCriteria
+    ? [...previous.acceptanceCriteria, ...additions.acceptanceCriteria]
+    : previous.acceptanceCriteria;
 
   return {
     id: previous.id,

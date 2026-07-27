@@ -18,7 +18,7 @@
  *   的 scopeHash 一致（P1-02）。
  */
 
-import type { Task, TaskInput, TaskStatus, ApprovalRecord } from "../domain/task.js";
+import type { Task, TaskInput, TaskStatus, ApprovalRecord, Plan, PlanNode } from "../domain/task.js";
 import {
   transition,
   isTerminalStatus,
@@ -26,7 +26,17 @@ import {
   canComplete,
   isApprovalInvalidated
 } from "../domain/task.js";
-import type { Project } from "../domain/project.js";
+import type { Project, ProjectCommands } from "../domain/project.js";
+import type {
+  EvidenceItem,
+  Hypothesis,
+  EvidenceConstraint,
+  EvidencePack,
+  EvidenceRequest,
+  EvidenceKind
+} from "../domain/evidence.js";
+import { computePackContentHash, nextPackVersion } from "../domain/evidence.js";
+import type { Worktree } from "../ports/adapters.js";
 import type {
   AuditEvent,
   AuditEventType
@@ -402,17 +412,20 @@ export class TaskOrchestrator {
   }
 
   /**
-   * 进入 EXECUTING 前的 scopeHash 校验闸门（P1-02）。
+   * 进入 EXECUTING 前的 scopeHash 校验闸门（P1-02 / P1-R04）。
    *
-   * 调用方传入当前 Plan 的 scopeHash，Orchestrator 在事务内读取当前
-   * 有效执行审批，比对两者。不一致则抛 ScopeMismatchError，阻止迁移。
+   * **P1-R04 修正**：不再接受调用方传入的 `planScopeHash`。调用方可
+   * 持有陈旧或伪造的 hash，在同名命令 argv 替换后仍能通过校验。现在
+   * Orchestrator 在事务内通过 `computeCurrentScopeHashFromTx` 从
+   * `task.currentPlanId`、当前项目命令与风险等级重新计算权威 scopeHash，
+   * 再与 approval.scopeHash 比对。不一致则抛 ScopeMismatchError。
    *
    * 用法：
    * ```ts
-   * await orchestrator.beginExecutionIfApproved(taskId, planScopeHash);
+   * await orchestrator.beginExecutionIfApproved(taskId);
    * ```
    */
-  async beginExecutionIfApproved(taskId: string, planScopeHash: string): Promise<Task> {
+  async beginExecutionIfApproved(taskId: string): Promise<Task> {
     return this.deps.unitOfWork.run(async (tx) => {
       const current = await tx.tasks.findById(taskId);
       if (!current) throw new TaskNotFoundError(taskId);
@@ -423,10 +436,18 @@ export class TaskOrchestrator {
       }
       const approval = await tx.approvals.findLatestExecutionApproval(taskId);
       if (!approval) {
-        throw new ScopeMismatchError(taskId, planScopeHash, undefined);
+        throw new ScopeMismatchError(taskId, "<none>", undefined);
       }
-      if (approval.scopeHash !== planScopeHash) {
-        throw new ScopeMismatchError(taskId, planScopeHash, approval.scopeHash);
+
+      // P1-R04：事务内重算权威 scopeHash，不信任调用方传入的值。
+      const currentScopeHash = await computeCurrentScopeHashFromTx(tx, taskId);
+
+      if (approval.scopeHash !== currentScopeHash) {
+        throw new ScopeMismatchError(
+          taskId,
+          currentScopeHash,
+          approval.scopeHash
+        );
       }
 
       // 校验通过，迁移到 EXECUTING 并写审计。
@@ -483,21 +504,543 @@ export class TaskOrchestrator {
       auditEventType: "task_transitioned"
     });
   }
+
+  // -----------------------------------------------------------------------
+  // Phase 3：证据 / Pack / worktree 编排方法（§5.3、§8.1 步骤 3-5）
+  // -----------------------------------------------------------------------
+
+  /**
+   * P1-R03：在 PLANNED 状态下持久化 Plan（含 allowedPaths）。
+   *
+   * 见规格 §8.1 步骤 4：Planner 输出线性计划，确定 allowedPaths。
+   * allowedPaths 是执行审批范围快照的组成部分，后续
+   * `WorktreeManager.createAndAttachWorktree` 必须从 Plan 读取
+   * allowedPaths，不得信任请求体提供的任意值。
+   *
+   * 在同一 UnitOfWork 事务内：
+   * - 校验任务处于 PLANNED 状态
+   * - 持久化 Plan（含 allowedPaths）
+   * - 更新 task.currentPlanId
+   * - 追加 plan_recorded 审计事件
+   *
+   * 本方法不迁移状态。PLANNED → AWAITING_EXECUTION_APPROVAL 仍由
+   * `transitionTask` 处理，确保状态机单入口。
+   */
+  async planTask(args: {
+    readonly taskId: string;
+    readonly planId?: string;
+    readonly nodes: readonly PlanNode[];
+    readonly allowedPaths: readonly string[];
+    readonly inputEvidencePackId: string;
+    readonly inputEvidencePackVersion: number;
+  }): Promise<Plan> {
+    return this.deps.unitOfWork.run(async (tx) => {
+      const task = await tx.tasks.findById(args.taskId);
+      if (!task) throw new TaskNotFoundError(args.taskId);
+      if (task.status !== "PLANNED") {
+        throw new IllegalTransitionError(
+          `仅 PLANNED 状态可记录 Plan，当前：${task.status}`
+        );
+      }
+
+      const createdAt = new Date().toISOString();
+      const plan: Plan = {
+        id: args.planId ?? randomId("plan"),
+        taskId: args.taskId,
+        nodes: [...args.nodes],
+        inputEvidencePackId: args.inputEvidencePackId,
+        inputEvidencePackVersion: args.inputEvidencePackVersion,
+        createdAt,
+        allowedPaths: [...args.allowedPaths]
+      };
+
+      await tx.plans.save(plan);
+
+      const updatedTask: Task = {
+        ...task,
+        currentPlanId: plan.id,
+        updatedAt: createdAt
+      };
+      await tx.tasks.save(updatedTask);
+
+      await tx.audit.append(
+        createAuditEvent({
+          taskId: args.taskId,
+          type: "plan_recorded",
+          planId: plan.id,
+          reason: `记录 Plan ${plan.id}：${plan.nodes.length} 个节点，allowedPaths=${plan.allowedPaths.join(",")}`
+        })
+      );
+
+      return plan;
+    });
+  }
+
+  /**
+   * P1-R03 / P1-R04：计算任务当前的 scopeHash。
+   *
+   * 从持久化的 Plan.allowedPaths + Project.commands 完整契约 +
+   * TaskInput.riskLevel 计算 scopeHash。这是执行审批范围快照的权威来源。
+   *
+   * **P1-R04 修正**：
+   * - scopeHash 必须包含每条命令的完整 argv + timeoutMs，不得仅哈希命令 key。
+   *   否则审批后保留同一 key 但替换 argv（例如把 `pytest` 改成 `rm -rf /`）
+   *   不会改变 scopeHash，违反规格 §7.2。
+   * - 必须使用 `task.currentPlanId` 读取权威 Plan，不得以按时间排序的
+   *   "最后一条 Plan"代替。否则旧 Plan 仍可被用于通过校验。
+   *
+   * 调用方：
+   * - `recordApproval` 调用前先调用本方法获取 scopeHash
+   * - `WorktreeManager.createAndAttachWorktree` 在事务内调用本方法
+   *   比对 approval.scopeHash
+   * - `beginExecutionIfApproved` 在事务内调用本方法重算权威 scopeHash
+   */
+  async computeCurrentScopeHash(taskId: string): Promise<string> {
+    return this.deps.unitOfWork.run(async (tx) => {
+      const task = await tx.tasks.findById(taskId);
+      if (!task) throw new TaskNotFoundError(taskId);
+
+      const project = await tx.projects.findById(task.projectId);
+      if (!project) {
+        throw new Error(`项目 ${task.projectId} 不存在（任务 ${taskId}）`);
+      }
+
+      // P1-R04：使用 task.currentPlanId 读取权威 Plan，而非按时间排序的最后一条。
+      if (!task.currentPlanId) {
+        throw new Error(
+          `任务 ${taskId} 尚未记录 Plan（currentPlanId 为空），无法计算 scopeHash`
+        );
+      }
+      const plan = await tx.plans.findById(task.currentPlanId);
+      if (!plan) {
+        throw new Error(
+          `任务 ${taskId} 的 currentPlanId=${task.currentPlanId} 在 Plan 仓储中不存在`
+        );
+      }
+
+      return computeScopeHash({
+        allowedPaths: plan.allowedPaths,
+        commands: project.commands,
+        riskLevel: task.input.riskLevel
+      });
+    });
+  }
+
+  /**
+   * 在 GATHERING_EVIDENCE 状态下收集证据并生成 Evidence Pack v1。
+   *
+   * 在同一 UnitOfWork 事务内：
+   * - 校验任务处于 GATHERING_EVIDENCE 状态，否则抛 IllegalTransitionError
+   * - P1-05：验证每条证据的可回溯字段（source、locator、contentHash）非空
+   * - 构造 Pack v1（version=1），计算 contentHash
+   * - 持久化 Pack，更新 task.currentEvidencePackId / Version
+   * - 追加 evidence_pack_versioned 审计事件
+   */
+  async gatherEvidenceAndCreatePack(args: {
+    taskId: string;
+    packId: string;
+    evidence: readonly EvidenceItem[];
+    hypotheses?: readonly Hypothesis[];
+    constraints?: readonly EvidenceConstraint[];
+    acceptanceCriteria?: readonly string[];
+  }): Promise<EvidencePack> {
+    return this.deps.unitOfWork.run(async (tx) => {
+      const task = await tx.tasks.findById(args.taskId);
+      if (!task) throw new TaskNotFoundError(args.taskId);
+      if (task.status !== "GATHERING_EVIDENCE") {
+        throw new IllegalTransitionError(
+          `仅 GATHERING_EVIDENCE 状态可生成 Evidence Pack v1，当前：${task.status}`
+        );
+      }
+
+      // P1-05：验证每条证据的可回溯字段非空。
+      // 所有 Pack 证据必须可回溯来源（§5.3、Phase 3 退出条件）。
+      for (const item of args.evidence) {
+        if (!item.source || item.source.length === 0) {
+          throw new Error(
+            `EvidenceItem ${item.id} 缺少 source 字段，所有 Pack 证据必须可回溯来源`
+          );
+        }
+        if (!item.locator || item.locator.length === 0) {
+          throw new Error(
+            `EvidenceItem ${item.id} 缺少 locator 字段，所有 Pack 证据必须可回溯来源`
+          );
+        }
+        if (!item.contentHash || item.contentHash.length === 0) {
+          throw new Error(
+            `EvidenceItem ${item.id} 缺少 contentHash 字段，所有 Pack 证据必须可回溯来源`
+          );
+        }
+      }
+
+      const evidence = [...args.evidence];
+      const hypotheses = args.hypotheses ? [...args.hypotheses] : [];
+      const constraints = args.constraints ? [...args.constraints] : [];
+      const acceptanceCriteria = args.acceptanceCriteria ?? [];
+
+      const createdAt = new Date().toISOString();
+      const contentHash = computePackContentHash({
+        id: args.packId,
+        taskId: args.taskId,
+        version: 1,
+        taskSnapshot: task.input,
+        evidence,
+        hypotheses,
+        constraints,
+        acceptanceCriteria
+      });
+
+      const pack: EvidencePack = {
+        id: args.packId,
+        taskId: args.taskId,
+        version: 1,
+        taskSnapshot: task.input,
+        evidence,
+        hypotheses,
+        constraints,
+        acceptanceCriteria,
+        createdAt,
+        contentHash
+      };
+
+      await tx.evidencePacks.save(pack);
+
+      const updatedTask: Task = {
+        ...task,
+        currentEvidencePackId: pack.id,
+        currentEvidencePackVersion: 1,
+        updatedAt: createdAt
+      };
+      await tx.tasks.save(updatedTask);
+
+      await tx.audit.append(
+        createAuditEvent({
+          taskId: args.taskId,
+          type: "evidence_pack_versioned",
+          evidencePackId: pack.id,
+          evidencePackVersion: pack.version,
+          evidencePackHash: pack.contentHash,
+          reason: "生成 Evidence Pack v1"
+        })
+      );
+
+      return pack;
+    });
+  }
+
+  /**
+   * 提交 EvidenceRequest —— Agent 发现证据不足时的结构化请求。
+   *
+   * 在同一 UnitOfWork 事务内：
+   * - 校验任务存在
+   * - 持久化 EvidenceRequest
+   * - 若任务处于 EXECUTING：迁移到 EVIDENCE_GAP（经纯状态机校验）
+   * - 否则保持当前状态
+   * - 追加 evidence_request_submitted 审计事件
+   */
+  async submitEvidenceRequest(args: {
+    taskId: string;
+    requestId?: string;
+    requesterRole: "planner" | "developer" | "reviewer";
+    gapReason: string;
+    neededKinds: readonly EvidenceKind[];
+    allowedScope: string;
+    expectedPlanImpact: string;
+  }): Promise<EvidenceRequest> {
+    return this.deps.unitOfWork.run(async (tx) => {
+      const task = await tx.tasks.findById(args.taskId);
+      if (!task) throw new TaskNotFoundError(args.taskId);
+
+      const requestedAt = new Date().toISOString();
+      const req: EvidenceRequest = {
+        id: args.requestId ?? randomId("ereq"),
+        taskId: args.taskId,
+        requesterRole: args.requesterRole,
+        gapReason: args.gapReason,
+        neededKinds: [...args.neededKinds],
+        allowedScope: args.allowedScope,
+        expectedPlanImpact: args.expectedPlanImpact,
+        requestedAt
+      };
+
+      await tx.evidenceRequests.save(req);
+
+      let updatedTask = task;
+      if (task.status === "EXECUTING") {
+        // 纯状态机校验：EXECUTING → EVIDENCE_GAP 必须合法。
+        transition(task.status, "EVIDENCE_GAP");
+        updatedTask = {
+          ...task,
+          status: "EVIDENCE_GAP",
+          updatedAt: requestedAt
+        };
+        await tx.tasks.save(updatedTask);
+      }
+
+      await tx.audit.append(
+        createAuditEvent({
+          taskId: args.taskId,
+          type: "evidence_request_submitted",
+          fromStatus: task.status,
+          toStatus: updatedTask.status,
+          reason: args.gapReason
+        })
+      );
+
+      return req;
+    });
+  }
+
+  /**
+   * 基于 EvidenceRequest 升级 Pack 版本（v(n+1)）。
+   *
+   * 在同一 UnitOfWork 事务内：
+   * - 校验任务与 EvidenceRequest 存在
+   * - P1-04：校验 EvidenceRequest.taskId === args.taskId，拒绝跨任务 Request
+   * - 读取当前 Pack 最新版本
+   * - 调用 nextPackVersion 生成新版本
+   * - 持久化新 Pack，更新 task.currentEvidencePackVersion
+   * - 追加 evidence_pack_versioned 审计事件
+   *
+   * 旧版本永久保留以供审计（§5.3）。
+   */
+  async evolvePackWithNewEvidence(args: {
+    taskId: string;
+    requestId: string;
+    additions: {
+      evidence: readonly EvidenceItem[];
+      hypotheses?: readonly Hypothesis[];
+      constraints?: readonly EvidenceConstraint[];
+      acceptanceCriteria?: readonly string[];
+    };
+  }): Promise<EvidencePack> {
+    return this.deps.unitOfWork.run(async (tx) => {
+      const task = await tx.tasks.findById(args.taskId);
+      if (!task) throw new TaskNotFoundError(args.taskId);
+
+      const req = await tx.evidenceRequests.findById(args.requestId);
+      if (!req) {
+        throw new Error(`EvidenceRequest 不存在：${args.requestId}`);
+      }
+
+      // P1-04：拒绝跨任务 Evidence Request。
+      // 一个任务的 Request 不可用于升级另一个任务的 Pack，
+      // 保证 Pack 与证据请求的任务隔离。
+      if (req.taskId !== args.taskId) {
+        throw new Error(
+          `EvidenceRequest ${args.requestId} 属于任务 ${req.taskId}，不可用于升级任务 ${args.taskId} 的 Pack`
+        );
+      }
+
+      if (!task.currentEvidencePackId) {
+        throw new Error(
+          `任务 ${args.taskId} 尚未关联 Evidence Pack，无法升级版本`
+        );
+      }
+      const previous = await tx.evidencePacks.findLatestVersion(
+        task.currentEvidencePackId
+      );
+      if (!previous) {
+        throw new Error(
+          `Evidence Pack ${task.currentEvidencePackId} 不存在最新版本`
+        );
+      }
+
+      const newPack = nextPackVersion(previous, args.additions);
+      await tx.evidencePacks.save(newPack);
+
+      const updatedTask: Task = {
+        ...task,
+        currentEvidencePackVersion: newPack.version,
+        updatedAt: newPack.createdAt
+      };
+      await tx.tasks.save(updatedTask);
+
+      await tx.audit.append(
+        createAuditEvent({
+          taskId: args.taskId,
+          type: "evidence_pack_versioned",
+          evidencePackId: newPack.id,
+          evidencePackVersion: newPack.version,
+          evidencePackHash: newPack.contentHash,
+          reason: "基于 EvidenceRequest 升级 Pack 版本"
+        })
+      );
+
+      return newPack;
+    });
+  }
+
+  /**
+   * 将 worktree 登记并关联到任务（P1-01 修复）。
+   *
+   * 在同一 UnitOfWork 事务内：
+   * - 校验任务存在
+   * - 调用 tx.worktrees.save(worktree) 持久化登记记录（避免数据库外键
+   *   式引用指向不存在的 worktree）
+   * - 更新 task.worktreeId
+   * - 追加 worktree_created 审计事件，reason 携带 worktreeId / path /
+   *   branch 用于审计回溯
+   *
+   * 失败时由 UnitOfWork 回滚整个事务，保证 task 与 worktree 登记一致。
+   * Adapter 层（LocalGitAdapter.createWorktree）的真实 git 操作在本方法
+   * 之外执行；调用方（WorktreeManager）负责在 git 操作成功后再调用本方法，
+   * 并在失败时调用 removeRegisteredWorktree 进行受控清理。
+   */
+  async attachWorktree(taskId: string, worktree: Worktree): Promise<Task> {
+    return this.deps.unitOfWork.run(async (tx) => {
+      const task = await tx.tasks.findById(taskId);
+      if (!task) throw new TaskNotFoundError(taskId);
+
+      // P1-01：在同一事务内保存 worktree 登记记录。
+      await tx.worktrees.save(worktree);
+
+      const updatedAt = new Date().toISOString();
+      const updatedTask: Task = {
+        ...task,
+        worktreeId: worktree.id,
+        updatedAt
+      };
+      await tx.tasks.save(updatedTask);
+
+      await tx.audit.append(
+        createAuditEvent({
+          taskId,
+          type: "worktree_created",
+          reason: `登记 worktree ${worktree.id} (path=${worktree.path}, branch=${worktree.branch}, baseCommit=${worktree.baseCommitSha})`
+        })
+      );
+
+      return updatedTask;
+    });
+  }
+
+  /**
+   * 在同一 UnitOfWork 事务内删除 worktree 登记并追加 worktree_removed
+   * 审计事件（P1-01 修复）。
+   *
+   * 调用方（WorktreeManager）必须先校验：
+   * - worktree 在数据库中已登记（findById 命中）
+   * - 关联任务已处于终态（COMPLETED / FAILED / CANCELLED / INTERRUPTED /
+   *   REJECTED）
+   * - worktree.path 经 PathPolicy 校验位于受控 worktree 根目录内
+   * 之后才能调用 Adapter.removeRegisteredWorktree 执行真实 git 清理，
+   * 清理成功后调用本方法删除登记记录并写审计。
+   */
+  async detachWorktree(taskId: string, worktreeId: string, reason: string): Promise<void> {
+    return this.deps.unitOfWork.run(async (tx) => {
+      const task = await tx.tasks.findById(taskId);
+      if (!task) throw new TaskNotFoundError(taskId);
+
+      const registered = await tx.worktrees.findById(worktreeId);
+      if (!registered) {
+        throw new Error(`worktree ${worktreeId} 未在数据库登记，无法 detach`);
+      }
+      if (registered.taskId !== taskId) {
+        throw new Error(
+          `worktree ${worktreeId} 属于任务 ${registered.taskId}，不可从任务 ${taskId} detach`
+        );
+      }
+
+      await tx.worktrees.delete(worktreeId);
+
+      // 解除 task.worktreeId 引用，保持 task 与登记一致。
+      if (task.worktreeId === worktreeId) {
+        const updatedTask: Task = {
+          ...task,
+          worktreeId: undefined,
+          updatedAt: new Date().toISOString()
+        };
+        await tx.tasks.save(updatedTask);
+      }
+
+      await tx.audit.append(
+        createAuditEvent({
+          taskId,
+          type: "worktree_removed",
+          reason: `回收 worktree ${worktreeId} (path=${registered.path}): ${reason}`
+        })
+      );
+    });
+  }
+}
+
+/**
+ * P1-R04：在已开启的事务内计算任务当前的 scopeHash。
+ *
+ * 与 `computeCurrentScopeHash` 方法等价，但避免在 `beginExecutionIfApproved`
+ * 事务回调内再调用 `unitOfWork.run` 导致嵌套事务（SQLite 串行队列会死锁）。
+ *
+ * 必须传入当前事务的 `tx`，从 `task.currentPlanId` 读取权威 Plan，
+ * 并使用 Project.commands 完整契约（argv + timeoutMs）计算 scopeHash。
+ */
+async function computeCurrentScopeHashFromTx(
+  tx: TransactionalRepos,
+  taskId: string
+): Promise<string> {
+  const task = await tx.tasks.findById(taskId);
+  if (!task) throw new TaskNotFoundError(taskId);
+
+  const project = await tx.projects.findById(task.projectId);
+  if (!project) {
+    throw new Error(`项目 ${task.projectId} 不存在（任务 ${taskId}）`);
+  }
+
+  if (!task.currentPlanId) {
+    throw new Error(
+      `任务 ${taskId} 尚未记录 Plan（currentPlanId 为空），无法计算 scopeHash`
+    );
+  }
+  const plan = await tx.plans.findById(task.currentPlanId);
+  if (!plan) {
+    throw new Error(
+      `任务 ${taskId} 的 currentPlanId=${task.currentPlanId} 在 Plan 仓储中不存在`
+    );
+  }
+
+  return computeScopeHash({
+    allowedPaths: plan.allowedPaths,
+    commands: project.commands,
+    riskLevel: task.input.riskLevel
+  });
 }
 
 /**
  * 适配器 / API 用的辅助函数：根据 Plan + worktree 允许路径 + 风险等级
  * 计算 scope 哈希，供 Orchestrator 检测范围扩大。
+ *
+ * P1-R04：commandWhitelist 必须包含每条命令的完整契约（argv + timeoutMs），
+ * 不得仅哈希命令 key。否则审批后保留同一 key 但替换 argv 不会改变
+ * scopeHash，违反规格 §7.2「命令只能匹配项目注册时固定 argv 白名单」。
+ *
+ * 规范化规则：
+ * - 命令按 key 排序（lint / typecheck / test / build）
+ * - 每条命令的 argv 数组按原序保留（argv 顺序影响执行语义）
+ * - timeoutMs 直接参与哈希
+ * - allowedPaths 按字典序排序
+ * - riskLevel 原样参与
  */
 export function computeScopeHash(args: {
   allowedPaths: readonly string[];
-  commandWhitelist: readonly string[];
+  /** 完整命令契约（argv + timeoutMs），按 key 排序后参与哈希。 */
+  commands: ProjectCommands;
   riskLevel: string;
 }): string {
   // 确定性规范化序列化；与 Pack 相同的 FNV-1a 方法。
+  // 命令按 key 排序，每条命令的 argv 按原序保留。
+  const commandKeys = Object.keys(args.commands).sort();
+  const commandsCanonical = commandKeys.map((key) => {
+    const spec = args.commands[key as keyof ProjectCommands];
+    return {
+      key,
+      argv: spec ? [...spec.argv] : null,
+      timeoutMs: spec ? spec.timeoutMs : null
+    };
+  });
+
   const canonical = JSON.stringify({
     allowedPaths: [...args.allowedPaths].sort(),
-    commandWhitelist: [...args.commandWhitelist].sort(),
+    commands: commandsCanonical,
     riskLevel: args.riskLevel
   } as const);
   let hash = 0x811c9dc5;

@@ -105,7 +105,9 @@ export const plans = sqliteTable("plans", {
   nodesJson: text("nodes_json").notNull(),
   inputEvidencePackId: text("input_evidence_pack_id").notNull(),
   inputEvidencePackVersion: integer("input_evidence_pack_version").notNull(),
-  createdAt: text("created_at").notNull()
+  createdAt: text("created_at").notNull(),
+  /** P1-R03：Plan 批准的 allowedPaths 白名单 JSON。 */
+  allowedPathsJson: text("allowed_paths_json").notNull().default("[]")
 });
 
 // ---------------------------------------------------------------------------

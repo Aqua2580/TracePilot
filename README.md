@@ -2,7 +2,7 @@
 
 > 证据驱动的本地 Git 仓库修复平台。
 >
-> 本仓库已完成 Phase 0、Phase 1 与 **Phase 2（SQLite、Fake 闭环与评测基准）独立验收**，可以进入 Phase 3。完整规格见 [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md)，Phase 1 验收报告见 [`docs/reviews/PHASE-1-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-1-ACCEPTANCE-REVIEW.md)，Phase 2 验收报告见 [`docs/reviews/PHASE-2-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-2-ACCEPTANCE-REVIEW.md)，开发规则见 [`AGENTS.md`](AGENTS.md)。
+> 本仓库已完成 Phase 0、Phase 1、Phase 2（SQLite、Fake 闭环与评测基准）与 **Phase 3（Git 与证据）** 的独立验收。完整规格见 [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md)，各阶段验收结论见 [`docs/reviews/`](docs/reviews/)，开发规则见 [`AGENTS.md`](AGENTS.md)。
 
 ## 一、项目简介
 
@@ -31,6 +31,7 @@ CREATED → INTAKING → GATHERING_EVIDENCE → PLANNED
 | API | Fastify + REST + SSE（SSE 后置阶段） |
 | 日志 | Pino |
 | 持久化 | SQLite + Drizzle ORM（Phase 2 已接入；见 [ADR-005](docs/adr/ADR-005-sqlite-runtime.md)） |
+| Git | `LocalGitAdapter`（Phase 3 已接入；经 `ProcessRunner` + `CommandPolicy` + `PathPolicy` 治理，见 [ADR-002](docs/adr/ADR-002-worktree-and-command-safety.md)） |
 | 测试 | Vitest（单元 / 契约 / 集成） |
 | Runtime | MVP 用 `LocalCommandAdapter`；Phase 4 替换为真实 `OmpAdapter`（见 [ADR-001](docs/adr/ADR-001-runtime-boundary.md)） |
 
@@ -46,16 +47,18 @@ tracepilot/
 │   ├── IMPLEMENTATION_SPEC.md         # 权威规格
 │   ├── reviews/                       # 各阶段验收报告
 │   │   ├── PHASE-1-ACCEPTANCE-REVIEW.md
-│   │   └── PHASE-2-ACCEPTANCE-REVIEW.md
+│   │   ├── PHASE-2-ACCEPTANCE-REVIEW.md
+│   │   └── PHASE-3-ACCEPTANCE-REVIEW.md  # Phase 3 独立验收报告
 │   └── adr/
-│       ├── ADR-001-runtime-boundary.md # Runtime 边界决策
-│       └── ADR-005-sqlite-runtime.md   # SQLite 运行时约束
+│       ├── ADR-001-runtime-boundary.md   # Runtime 边界决策
+│       ├── ADR-002-worktree-and-command-safety.md  # Worktree 受控根目录与命令安全（Phase 3）
+│       └── ADR-005-sqlite-runtime.md     # SQLite 运行时约束
 ├── package.json / pnpm-workspace.yaml # workspace 配置（engineStrict）
 ├── tsconfig.base.json                 # strict TS 基线
 ├── packages/
-│   ├── core/                          # 领域模型 + 状态机 + ports + InMemory repos + Orchestrator
+│   ├── core/                          # 领域模型 + 状态机 + ports + InMemory repos + Orchestrator + EvidenceRouter
 │   ├── governance/                    # 默认 command/path/approval/audit 策略
-│   ├── adapters/                      # LocalCommandAdapter + OmpAdapter stub + Fakes
+│   ├── adapters/                      # LocalCommandAdapter + LocalGitAdapter + git-parsers + Fakes
 │   └── store/                         # SQLite + Drizzle schema + 迁移 + 仓储 + UnitOfWork + RuntimeEventBuffer
 └── apps/
     └── api/                           # Fastify composition root + Pino（Phase 2 SQLite 装配）
@@ -93,7 +96,7 @@ pnpm install --no-frozen-lockfile
 pnpm -r run test
 ```
 
-预期输出（Node 24 实测）：
+Phase 2 独立验收时的测试统计（Node 24 环境复验，作为历史基线）：
 
 | 包 | 结果 |
 | --- | --- |
@@ -105,6 +108,8 @@ pnpm -r run test
 | **合计** | **417 通过，1 跳过** |
 
 > 上述数字已由独立 Reviewer 在 Node 24 环境复验通过。完整命令和验收范围见 [`docs/reviews/PHASE-2-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-2-ACCEPTANCE-REVIEW.md)。
+
+Phase 3 在 Phase 2 基础上新增了 `LocalGitAdapter`、`git-parsers`、`EvidenceRouter`、受控 WorktreeManager、证据/Pack 编排、`git-adapter-contract` 契约测试与真实 Git 集成测试。该阶段已由独立 Reviewer 验收通过；完整测试统计、P1 修复历史和后续不可回退边界见 [`docs/reviews/PHASE-3-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-3-ACCEPTANCE-REVIEW.md)。
 
 ### 5.2 单独跑某个包
 
@@ -135,14 +140,18 @@ pnpm -r run build       # 全包构建（生成 dist/）
 | 测试文件 | 验证内容 |
 | --- | --- |
 | `packages/core/tests/task-state-machine.test.ts` | §5.2 状态机：合法/非法迁移、终态、INTERRUPTED 恢复、`canComplete` 前置条件 |
-| `packages/core/tests/task-orchestrator.test.ts` | 状态迁移+审计同事务、取消、失败、中断恢复、审批记录、scope 失效、完成门槛 |
+| `packages/core/tests/task-orchestrator.test.ts` | 状态迁移+审计同事务、取消、失败、中断恢复、审批记录、scope 失效、完成门槛、Phase 3 Pack v1/v(n+1) 编排、attachWorktree 审计、EvidenceRequest 状态迁移 |
 | `packages/core/tests/repair-record.test.ts` | §5.4 Repair Record 状态机、不可跳过 VERIFIED |
 | `packages/core/tests/evidence-pack.test.ts` | §5.3 Pack 版本不可变、内容哈希稳定且区分版本 |
-| `packages/governance/tests/command-policy.test.ts` | §7.2 命令白名单、默认拒绝列表、风险分级、全局选项绕过防御 |
+| `packages/core/tests/evidence-router.test.ts` | §8.1 EvidenceRouter：failed_test_log / issue 两种 origin 的请求清单、确定性、空 failure fallback |
+| `packages/governance/tests/command-policy.test.ts` | §7.2 命令白名单、默认拒绝列表、风险分级、全局选项绕过防御、git worktree 子命令结构化判定 |
 | `packages/governance/tests/path-policy.test.ts` | §7.2 路径穿越拒绝、symlink 逃逸拒绝 |
 | `packages/governance/tests/approval-policy.test.ts` | §7.2 风险表四档审批决策 |
 | `packages/governance/tests/audit-policy.test.ts` | §7.3 环境变量脱敏、输出截断 |
 | `packages/adapters/tests/adapters-smoke.test.ts` | Fake/Local/Omp 适配器行为、ADR-001 stub 抛错 |
+| `packages/adapters/tests/git-parsers.test.ts` | git log / blame / diff / status 输出解析、空输出、多 commit、中文文件名 |
+| `packages/adapters/tests/git-adapter-contract.test.ts` | §6 契约测试：FakeGitAdapter 与 LocalGitAdapter 通过同一套断言（结构、字段、路径穿越拒绝、未登记 worktree 拒绝） |
+| `packages/adapters/tests/local-git-adapter.test.ts` | Phase 3 退出条件：python / typescript 样例仓库 worktree 创建/回收全流程、边界拒绝（非仓库、脏仓库、路径穿越、覆盖、受控根目录外） |
 | `packages/store/tests/sqlite-store.test.ts` | SQLite 迁移、安全备份、WAL/锁等待、单写入队列、事务回滚、Evidence Pack 不可变、服务重启收口、双连接锁竞争 |
 | `packages/store/tests/runtime-event-buffer.test.ts` | RuntimeEventBuffer 单条截断、总量超限尾部保留、顺序保持、flush 失败重试、重启后查询 |
 | `packages/store/tests/benchmark-loop.test.ts` | 8 个固定基准任务消费 Fake Adapter 闭环、产物结构可重复 |
@@ -218,7 +227,7 @@ Invoke-WebRequest "http://127.0.0.1:7431/tasks/$taskId/transition" -Method POST 
 # StatusCode: 400, error: "Illegal transition ..."
 ```
 
-## 七、Phase 0 / Phase 2 决策摘要
+## 七、Phase 0 / Phase 2 / Phase 3 决策摘要
 
 ### Phase 0 Runtime 边界
 
@@ -238,12 +247,22 @@ Invoke-WebRequest "http://127.0.0.1:7431/tasks/$taskId/transition" -Method POST 
 - 单写入串行队列（`SqliteUnitOfWork`）+ `BEGIN IMMEDIATE` 短事务，保证事务不交错。
 - 服务重启时，`EXECUTING` / `VALIDATING` 任务自动迁移为 `INTERRUPTED` 并写审计。
 
+### Phase 3 Worktree 受控根目录与命令安全
+
+详见 [ADR-002](docs/adr/ADR-002-worktree-and-command-safety.md)：
+
+- worktree 唯一受控根目录为 `%LOCALAPPDATA%/TracePilot/worktrees/`，子目录布局 `<worktree-root>/<project-slug>/<task-id>/`。
+- `LocalGitAdapter` 的所有 git 命令经注入的 `ProcessRunner.run` 执行，禁止直接 `child_process.spawn`；argv 与 cwd 经 `CommandPolicy` / `PathPolicy` 校验。
+- `git worktree add` 归类为 `needs_execution_approval`，`LocalGitAdapter` 作为受控 Manager 直接执行；执行审批由 `TaskOrchestrator` 在 `AWAITING_EXECUTION_APPROVAL` 状态下处理。
+- `git worktree remove` 在 `CommandPolicy` 中默认拒绝（删除性操作）；`LocalGitAdapter.removeRegisteredWorktree` 在 `PathPolicy` 校验通过后直接调用 `ProcessRunner.run`，这是 ADR-002 的受控清理策略。
+- `FakeGitAdapter` 与 `LocalGitAdapter` 通过同一套契约测试（`git-adapter-contract.test.ts`），确保 Phase 4+ 替换时不引入回归。
+
 ## 八、后续阶段
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | Phase 2 | SQLite + Drizzle 持久化、契约测试套件、8 个固定基准任务 | 已独立验收通过 |
-| Phase 3 | 真实 Git worktree 创建/回收/Diff/历史 | 可开始 |
+| Phase 3 | 真实 Git worktree 创建/回收/Diff/历史/Blame、EvidenceRouter、Pack v1/v(n+1) 编排、契约测试、两个样例仓库集成测试、ADR-002 | 已独立验收通过 |
 | Phase 4 | 真实 `OmpAdapter` Spike（安装 `omp` 后） | 未开始 |
 | Phase 5 | 真实 Reviewer、Repair Memory 召回 | 未开始 |
 | Phase 6+ | Dashboard、SAG（后置） | 未开始 |

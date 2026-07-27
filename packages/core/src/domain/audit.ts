@@ -27,6 +27,7 @@ export type AuditEventType =
   | "repair_record_transitioned"
   | "evidence_request_submitted"
   | "evidence_request_granted"
+  | "evidence_router_request"
   | "policy_denied";
 
 export interface AuditEvent {

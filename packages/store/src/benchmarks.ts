@@ -313,6 +313,8 @@ export function createBenchmarkPlan(
     nodes: nodes.slice(0, fixture.expectedPlanNodeCount),
     inputEvidencePackId: evidencePackId,
     inputEvidencePackVersion: 1,
-    createdAt: "2026-01-01T00:00:00.000Z"
+    createdAt: "2026-01-01T00:00:00.000Z",
+    // P1-R03：Plan 持久化 allowedPaths 作为执行审批范围快照。
+    allowedPaths: ["src/", "tests/"]
   };
 }

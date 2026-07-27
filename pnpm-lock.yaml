@@ -126,6 +126,9 @@ importers:
       '@tracepilot/adapters':
         specifier: workspace:*
         version: link:../adapters
+      '@tracepilot/governance':
+        specifier: workspace:*
+        version: link:../governance
       '@types/better-sqlite3':
         specifier: ^7.6.13
         version: 7.6.13

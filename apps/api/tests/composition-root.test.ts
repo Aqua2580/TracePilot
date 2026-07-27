@@ -71,14 +71,14 @@ describe("API 组合根（SQLite 装配）", () => {
     safeCleanup(dbPath);
   });
 
-  it("GET /health 返回 200 并带 phase-2-sqlite 标记与 SQLite store", async () => {
+  it("GET /health 返回 200 并带 phase-3-git-evidence 标记与 SQLite store", async () => {
     const root = buildCompositionRoot({ dbPath });
     try {
       const res = await root.app.inject({ method: "GET", url: "/health" });
       expect(res.statusCode).toBe(200);
       const body = res.json() as { status: string; phase: string; runtime: string; store: string };
       expect(body.status).toBe("ok");
-      expect(body.phase).toBe("phase-2-sqlite");
+      expect(body.phase).toBe("phase-3-git-evidence");
       expect(body.runtime).toBe("LocalCommandAdapter");
       expect(body.store).toBe("SQLite");
     } finally {
