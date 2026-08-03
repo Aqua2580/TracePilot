@@ -199,6 +199,27 @@ const MIGRATIONS: readonly Migration[] = [
     sql: `
       ALTER TABLE plans ADD COLUMN allowed_paths_json TEXT NOT NULL DEFAULT '[]';
     `
+  },
+  {
+    version: 4,
+    description: "execution_results 表（P1-03：持久化 runDevelop 的 Diff 哈希与验证产物，供 runReview 受控读取）",
+    sql: `
+      CREATE TABLE IF NOT EXISTS execution_results (
+        id TEXT PRIMARY KEY NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL,
+        diff_hash TEXT NOT NULL,
+        diff_patch TEXT NOT NULL,
+        diff_changed_files_json TEXT NOT NULL,
+        diff_bytes INTEGER NOT NULL,
+        verification_exit_code INTEGER NOT NULL,
+        verification_passed INTEGER NOT NULL,
+        verification_stdout TEXT NOT NULL,
+        verification_stderr TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_execution_results_task ON execution_results(task_id);
+    `
   }
 ];
 

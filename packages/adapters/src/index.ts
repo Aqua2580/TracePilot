@@ -1,8 +1,8 @@
 /**
  * @tracepilot/adapters —— Runtime / Knowledge / Git / Process 实现。
  *
- * - LocalCommandAdapter：ADR-001 的 MVP Runtime 兜底实现（无需 omp）
- * - OmpAdapter：Phase 4 Spike 前抛 OmpUnavailableError 的 stub
+ * - LocalCommandAdapter：ADR-001 的 MVP Runtime 兜底实现（无需 omp；降级用途）
+ * - OmpAdapter：ADR-007 的 Phase 4 真实 Runtime 实现（prompt 驱动 omp 二进制）
  * - LocalProcessRunner：受治理闸门管控的子进程执行
  * - LocalGitAdapter：Phase 3 真实 GitAdapter 实现（worktree / diff / history / blame）
  * - git-parsers：git log/blame/diff/status 输出的纯字符串解析器
@@ -12,18 +12,28 @@
 
 export {
   LocalCommandAdapter,
-  OmpAdapter,
-  OmpUnavailableError,
   PolicyDeniedError,
   hashDiff,
   type LocalCommandAdapterOptions
 } from "./local-command-adapter.js";
+export {
+  OmpAdapter,
+  OmpUnavailableError,
+  OmpArgvValidationError,
+  parseOmpNdjsonEvents,
+  extractReviewResult,
+  extractFileChangesFromStdout,
+  extractFileChangesFromText,
+  type OmpAdapterOptions
+} from "./omp-adapter.js";
 export { LocalProcessRunner } from "./local-process-runner.js";
 export {
   LocalGitAdapter,
   resolveDefaultWorktreePath,
   type LocalGitAdapterOptions
 } from "./local-git-adapter.js";
+export { LocalWorktreeFilesystemGuard, ExecutionIsolationError } from "./local-worktree-filesystem-guard.js";
+export { LocalControlledFileWriter } from "./local-controlled-file-writer.js";
 export {
   parseGitLog,
   parseGitBlame,

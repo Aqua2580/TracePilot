@@ -11,6 +11,7 @@
   "scripts": {
     "build": "pnpm -r run build",
     "test": "pnpm -r run test",
+    "test:omp-real": "pnpm --filter @tracepilot/api run test:omp-real",
     "typecheck": "pnpm -r run typecheck",
     "lint": "pnpm -r run lint",
     "lint:root": "eslint ."

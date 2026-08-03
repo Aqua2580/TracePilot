@@ -92,6 +92,194 @@ export async function createTypescriptSampleRepo(tmpRoot: string): Promise<Sampl
 }
 
 /**
+ * Phase 4 失败任务样例：Python pytest 失败。
+ *
+ * 模拟真实失败场景：用户管理模块 `create_user` 在输入合法时
+ * 应返回 201，但实现错误地返回 400。pytest 测试明确失败。
+ * omp 需分析失败堆栈、定位 bug、修改 `src/users.py`、使测试通过。
+ *
+ * 失败堆栈：
+ *   FAILED tests/test_users.py::test_create_user_returns_201
+ *   assert response.status == 201, got 400
+ */
+export async function createPythonFailingRepo(tmpRoot: string): Promise<SampleRepo> {
+  const repoPath = join(tmpRoot, "python-failing-repo");
+  const worktreeRoot = join(tmpRoot, "python-failing-worktrees");
+
+  mkdirSync(repoPath, { recursive: true });
+  mkdirSync(worktreeRoot, { recursive: true });
+
+  runGit(["init", "-b", "main"], repoPath);
+  runGit(["config", "user.email", "test@example.com"], repoPath);
+  runGit(["config", "user.name", "Test User"], repoPath);
+  runGit(["config", "core.autocrlf", "false"], repoPath);
+
+  // pytest 配置
+  writeFileSync(join(repoPath, "pytest.ini"), "[pytest]\ntestpaths = tests\n");
+
+  // 有 bug 的用户管理模块
+  mkdirSync(join(repoPath, "src"), { recursive: true });
+  writeFileSync(
+    join(repoPath, "src", "users.py"),
+    [
+      '"""用户管理模块。"""',
+      "",
+      "",
+      "def create_user(name: str, email: str) -> dict:",
+      '    """创建用户，应返回 {"status": 201, "user": {...}}。"',
+      '    if not name or not email:',
+      '        return {"status": 400, "error": "参数为空"}',
+      "    # BUG：合法输入也错误返回 400，应返回 201",
+      '    return {"status": 400, "user": {"name": name, "email": email}}',
+      ""
+    ].join("\n")
+  );
+
+  // 失败的测试
+  mkdirSync(join(repoPath, "tests"), { recursive: true });
+  writeFileSync(
+    join(repoPath, "tests", "test_users.py"),
+    [
+      "from src.users import create_user",
+      "",
+      "",
+      "def test_create_user_returns_201():",
+      '    """合法输入应返回 status=201。"""',
+      '    result = create_user("alice", "alice@example.com")',
+      '    assert result["status"] == 201, f\'got {result["status"]}\'',
+      "",
+      "",
+      "def test_create_user_invalid_input():",
+      '    """空输入应返回 status=400。"""',
+      '    result = create_user("", "")',
+      '    assert result["status"] == 400',
+      ""
+    ].join("\n")
+  );
+
+  runGit(["add", "."], repoPath);
+  runGit(["commit", "-m", "初始提交：python 失败任务（create_user 返回错误状态码）"], repoPath);
+
+  return { repoPath, worktreeRoot };
+}
+
+/**
+ * Phase 4 失败任务样例：TypeScript Vitest 失败。
+ *
+ * 模拟真实失败场景：计算器模块 `divide` 未处理除零，
+ * 抛出未捕获异常。Vitest 测试明确失败。
+ * omp 需分析失败堆栈、定位 bug、修改 `src/calc.ts`、使测试通过。
+ *
+ * 失败堆栈：
+ *   FAIL tests/calc.test.ts > divide > 除零应抛出 DivisionByZeroError
+ *   Expected: DivisionByZeroError
+ *   Received: Infinity
+ */
+export async function createTypescriptFailingRepo(tmpRoot: string): Promise<SampleRepo> {
+  const repoPath = join(tmpRoot, "typescript-failing-repo");
+  const worktreeRoot = join(tmpRoot, "typescript-failing-worktrees");
+
+  mkdirSync(repoPath, { recursive: true });
+  mkdirSync(worktreeRoot, { recursive: true });
+
+  runGit(["init", "-b", "main"], repoPath);
+  runGit(["config", "user.email", "test@example.com"], repoPath);
+  runGit(["config", "user.name", "Test User"], repoPath);
+  runGit(["config", "core.autocrlf", "false"], repoPath);
+
+  // package.json：含 vitest 依赖声明（测试时由 TracePilot 注入 node_modules）
+  writeFileSync(
+    join(repoPath, "package.json"),
+    JSON.stringify(
+      {
+        name: "sample-ts-failing",
+        version: "1.0.0",
+        scripts: { test: "vitest run" },
+        devDependencies: {
+          vitest: "^2.0.0",
+          typescript: "^5.0.0"
+        }
+      },
+      null,
+      2
+    ) + "\n"
+  );
+
+  writeFileSync(
+    join(repoPath, "tsconfig.json"),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          target: "ES2022",
+          strict: true,
+          esModuleInterop: true
+        }
+      },
+      null,
+      2
+    ) + "\n"
+  );
+
+  // 有 bug 的计算器模块：除零未处理
+  mkdirSync(join(repoPath, "src"), { recursive: true });
+  writeFileSync(
+    join(repoPath, "src", "calc.ts"),
+    [
+      "/** 计算器模块。 */",
+      "",
+      "export class DivisionByZeroError extends Error {",
+      '  constructor() {',
+      '    super("除数不能为零");',
+      '    this.name = "DivisionByZeroError";',
+      "  }",
+      "}",
+      "",
+      "export function add(a: number, b: number): number {",
+      "  return a + b;",
+      "}",
+      "",
+      "export function divide(a: number, b: number): number {",
+      "  // BUG：未处理除零，应抛出 DivisionByZeroError",
+      "  return a / b;",
+      "}",
+      ""
+    ].join("\n")
+  );
+
+  // 失败的测试
+  mkdirSync(join(repoPath, "tests"), { recursive: true });
+  writeFileSync(
+    join(repoPath, "tests", "calc.test.ts"),
+    [
+      'import { describe, it, expect } from "vitest";',
+      'import { add, divide, DivisionByZeroError } from "../src/calc";',
+      "",
+      "describe(\"add\", () => {",
+      "  it(\"正数相加\", () => {",
+      "    expect(add(1, 2)).toBe(3);",
+      "  });",
+      "});",
+      "",
+      "describe(\"divide\", () => {",
+      "  it(\"正常除法\", () => {",
+      "    expect(divide(6, 3)).toBe(2);",
+      "  });",
+      "",
+      "  it(\"除零应抛出 DivisionByZeroError\", () => {",
+      "    expect(() => divide(1, 0)).toThrow(DivisionByZeroError);",
+      "  });",
+      "});",
+      ""
+    ].join("\n")
+  );
+
+  runGit(["add", "."], repoPath);
+  runGit(["commit", "-m", "初始提交：typescript 失败任务（divide 未处理除零）"], repoPath);
+
+  return { repoPath, worktreeRoot };
+}
+
+/**
  * 清理临时仓库目录。
  *
  * Windows 下 git 进程可能短暂持有文件锁，因此重试最多 3 次。

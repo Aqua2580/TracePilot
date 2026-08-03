@@ -6,7 +6,7 @@
  * （apps/api、orchestrator 装配、测试）注入具体 adapter。
  */
 
-import type { CommandSpec } from "../domain/project.js";
+import type { CommandSpec, ProjectCommands } from "../domain/project.js";
 import type {
   EvidencePackId,
   EvidencePackVersion
@@ -171,6 +171,15 @@ export interface RuntimeTaskInput {
   readonly evidencePackId: EvidencePackId;
   readonly evidencePackVersion: EvidencePackVersion;
   readonly taskInput: TaskInput;
+  /**
+   * 项目登记的命令白名单（test / lint / typecheck / build）。
+   *
+   * P4：OmpAdapter 在 prompt 中嵌入这些命令，告知 omp 可用的项目命令
+   * 及其固定 argv。LocalCommandAdapter 用它校验 omp 执行的命令是否
+   * 在白名单内。每个任务的 projectCommands 来自其所属 Project，
+   * 由 ExecutionOrchestrator 加载并传入。
+   */
+  readonly projectCommands: ProjectCommands;
 }
 
 export interface ReviewTaskInput {
@@ -204,12 +213,42 @@ export interface ReviewResult {
 }
 
 export interface RuntimeAdapter {
-  /** 读取 / 搜索仓库以收集证据。以流式返回事件。 */
-  analyze(input: RuntimeTaskInput): AsyncIterable<RuntimeEvent>;
-  /** 修改 worktree 内的文件。以流式返回事件。 */
-  develop(input: RuntimeTaskInput): AsyncIterable<RuntimeEvent>;
-  /** 基于 diff + 验证结果进行独立审查。 */
-  review(input: ReviewTaskInput): Promise<ReviewResult>;
+  /**
+   * 读取 / 搜索仓库以收集证据。以流式返回事件。
+   *
+   * P1-R02（Phase 4 第三轮验收 §7.3）：可选的 `signal` 允许调用方
+   * （ExecutionOrchestrator）在 Runtime 启动前或运行中取消执行。
+   * 实现必须：
+   * - 在启动子进程前检查 `signal.aborted`，若已 aborted 则直接 yield
+   *   `error` 事件，不启动子进程；
+   * - 把 `signal` 透传给 ProcessRunner，signal abort 时终止子进程树；
+   * - 在事件流消费过程中检查 `signal.aborted`，若已 aborted 则停止
+   *   yield 并清理资源。
+   *
+   * 这使取消 API 能在 Runtime 产出 `started` 事件前就阻止其启动，
+   * 解决注册前竞态（§7.3 第 1 点）。
+   */
+  analyze(input: RuntimeTaskInput, signal?: AbortSignal): AsyncIterable<RuntimeEvent>;
+  /**
+   * 修改 worktree 内的文件。以流式返回事件。
+   *
+   * P1-R02：与 `analyze` 相同的 `signal` 语义。
+   */
+  develop(input: RuntimeTaskInput, signal?: AbortSignal): AsyncIterable<RuntimeEvent>;
+  /**
+   * 基于 diff + 验证结果进行独立审查。
+   *
+   * P1-R02（Phase 4 第三轮验收 §7.3 第 2 点）：可选的 `signal` 允许
+   * 取消 API 在 REVIEWING 阶段终止 review 进程。实现必须把 `signal`
+   * 透传给 ProcessRunner，signal abort 时终止子进程树并抛出
+   * `AbortError`（或等价错误）。
+   *
+   * review 的 runId 由实现通过 `started` 事件产出；ExecutionOrchestrator
+   * 需要为 review 建立可取消的活动运行登记。由于 review 返回
+   * `Promise<ReviewResult>` 而非 `AsyncIterable<RuntimeEvent>`，
+   * ExecutionOrchestrator 通过 `signal` 实现取消，不再依赖 `cancel(runId)`。
+   */
+  review(input: ReviewTaskInput, signal?: AbortSignal): Promise<ReviewResult>;
   /** 取消进行中的 run。对未知 runId 调用也必须安全。 */
   cancel(runId: string): Promise<void>;
 }
@@ -245,6 +284,35 @@ export interface ProcessPolicy {
   readonly allowedCwdRoots: readonly string[];
   /** 若为 true，`env` 中的环境变量将被透传；否则使用干净的环境。 */
   readonly inheritEnv: boolean;
+  /**
+   * 当 `inheritEnv=false` 时，仅透传这些**名称**对应的环境变量到子进程。
+   *
+   * 用于 OmpAdapter 场景：omp 子进程需要 `ANTHROPIC_API_KEY` 等 LLM 凭据
+   * 才能调用模型，但不能无差别继承全部 `process.env`（避免泄漏其他敏感
+   * 变量）。白名单仅声明变量**名称**，实际值从 `process.env` 读取，
+   * 调用方无法通过此字段注入任意值。
+   *
+   * 当 `inheritEnv=true` 时此字段被忽略（全量透传已包含白名单）。
+   * 未定义或空数组时不透传任何额外变量（保持 Phase 1-3 行为）。
+   */
+  readonly allowedEnvVarNames?: readonly string[];
+  /**
+   * P1-02（Phase 4 验收）：当为 `true` 时，即使 `allowedEnvVarNames`
+   * 包含凭据变量名（匹配 `API_KEY|TOKEN|SECRET|CREDENTIAL|PASSWORD|
+   * PRIVATE_KEY` 模式），也拒绝透传该变量。
+   *
+   * 用于验证命令场景（`pnpm test` / `pytest` 等）：Developer 可修改
+   * worktree 中的测试脚本 / package.json / conftest，若验证子进程能读到
+   * LLM API key，恶意测试可外传凭据。验证命令的 processPolicy 必须设
+   * `disallowCredentialVars=true` 作为纵深防御，即使白名单误含凭据变量
+   * 名也能阻止泄漏。
+   *
+   * omp 子进程的 processPolicy 必须设 `disallowCredentialVars=false`
+   * （或不设），否则 omp 拿不到 LLM 凭据无法调用模型。
+   *
+   * 默认 `false`（向后兼容 Phase 1-3 行为）。
+   */
+  readonly disallowCredentialVars?: boolean;
 }
 
 export interface CommandResult {
@@ -262,5 +330,16 @@ export interface CommandResult {
 }
 
 export interface ProcessRunner {
-  run(spec: CommandSpec, cwd: string, policy: ProcessPolicy): Promise<CommandResult>;
+  /**
+   * 执行受治理的子进程。
+   *
+   * P1-05（Phase 4 验收）：可选的 `abortSignal` 允许调用方在子进程完成前
+   * 取消执行。当 signal 被 abort 时，ProcessRunner 必须终止整个进程树
+   * （含孙进程），并返回 `timedOut=false` 但 `exitCode` 非 0 的结果，
+   * 或抛出 `AbortError`。OmpAdapter.cancel 通过此机制终止进行中的 omp
+   * 子进程，而非仅设置内存标记。
+   *
+   * @param abortSignal 可选的取消信号。未提供时行为与 Phase 1-3 一致。
+   */
+  run(spec: CommandSpec, cwd: string, policy: ProcessPolicy, abortSignal?: AbortSignal): Promise<CommandResult>;
 }

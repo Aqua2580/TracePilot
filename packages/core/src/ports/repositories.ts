@@ -20,6 +20,7 @@ import type {
 import type { RepairRecord } from "../domain/repair-record.js";
 import type { AuditEvent } from "../domain/audit.js";
 import type { AgentRunRecord } from "../domain/agent-run.js";
+import type { ExecutionResult } from "../domain/execution-result.js";
 import type { Worktree } from "./adapters.js";
 
 export interface ProjectRepository {
@@ -101,6 +102,24 @@ export interface AgentRunRepository {
 }
 
 /**
+ * ExecutionResult 持久化端口 —— P1-03（Phase 4 验收）。
+ *
+ * `runDevelop` 完成后把受控 Diff 哈希、patch、changedFiles、验证退出码、
+ * 验证 stdout/stderr 持久化到此端口。`runReview` 从此端口读取受控来源
+ * 的验证产物，不接受调用方提交的 Diff 或验证结果。
+ *
+ * 安全约束：Reviewer 输入必须来自受控来源（§8.1 第 8 步）。
+ * 若当前工作树 Diff 与已验证哈希不一致，必须拒绝 Review。
+ */
+export interface ExecutionResultRepository {
+  save(result: ExecutionResult): Promise<void>;
+  /** 查找任务的最新执行结果（runReview 用此读取受控 Diff 与验证产物）。 */
+  findLatestByTask(taskId: string): Promise<ExecutionResult | undefined>;
+  /** 查找任务的所有执行结果（按创建时间升序）。 */
+  findByTask(taskId: string): Promise<ExecutionResult[]>;
+}
+
+/**
  * 聚合 UnitOfWork 接口。orchestrator 通过此接口强制实施
  * §5.2 不变量：状态转换 + 审计事件必须在
  * 同一 DB 事务中写入。InMemory 实现以单个同步块运行；
@@ -127,4 +146,6 @@ export interface TransactionalRepos {
   readonly repairRecords: RepairRecordRepository;
   readonly audit: AuditRepository;
   readonly agentRuns: AgentRunRepository;
+  /** P1-03：执行结果持久化（runDevelop 写入，runReview 受控读取）。 */
+  readonly executionResults: ExecutionResultRepository;
 }

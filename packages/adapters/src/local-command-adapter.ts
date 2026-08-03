@@ -2,18 +2,20 @@
  * LocalCommandAdapter —— ADR-001 中的 MVP Runtime 兜底实现。
  *
  * 仅使用本地 git + 文件系统 + 注入的 ProcessRunner 实现 `RuntimeAdapter`。
- * 不需要 `omp` 二进制。接口与未来的 `OmpAdapter` 一致，替换时无需改动
- * Orchestrator。
+ * 不需要 `omp` 二进制。接口与 `OmpAdapter`（Phase 4，见 omp-adapter.ts）
+ * 一致，替换时无需改动 Orchestrator。
  *
  * Phase 1 范围：提供 `analyze` / `develop` / `review` / `cancel` 形状，
- * 实现是确定性、受治理闸门管控的。真实 LLM 驱动的分析在 Phase 4 落地。
+ * 实现是确定性、受治理闸门管控的。真实 LLM 驱动的分析在 Phase 4 由
+ * `OmpAdapter` 落地；本类降级为 Spike、测试或明确记录的降级模式用途
+ * （AGENTS.md 规则 9、ADR-001）。
  *
  * P1-03 修复要点：
  * - 所有命令必须经注入的 `ProcessRunner` 执行；
  * - 调用前用 `CommandPolicy` 检查 argv，用 `PathPolicy` 校验 cwd 位于
  *   已登记 worktree 根目录内；
  * - 禁止在本文件中直接 `child_process.spawn`；
- * - 未来 `OmpAdapter` 必须复用相同边界，不得另行绕过。
+ * - `OmpAdapter` 必须复用相同边界，不得另行绕过（ADR-007 §决策 4）。
  */
 
 import { createHash } from "node:crypto";
@@ -34,41 +36,7 @@ import type {
   ProjectCommands
 } from "@tracepilot/core";
 
-/**
- * 当调用方请求未实现的 `OmpAdapter` 时抛出。ADR-001 保留此 stub，迫使
- * 调用方显式选择 LocalCommandAdapter 或 FakeRuntimeAdapter。
- */
-export class OmpUnavailableError extends Error {
-  constructor(message = "OmpAdapter 不可用 —— 未安装 omp 二进制。请使用 LocalCommandAdapter 或 FakeRuntimeAdapter。") {
-    super(message);
-    this.name = "OmpUnavailableError";
-  }
-}
-
-/**
- * 未来真实 OmpAdapter 的 stub。每次调用都抛错，确保任何装配错误立刻
- * 暴露。Phase 4 在 ADR-001 要求的 Spike 之后用真实 `omp` 实现替换。
- */
-export class OmpAdapter implements RuntimeAdapter {
-  // stub：Phase 4 真实实现前，generator 仅用于满足 AsyncIterable 签名，
-  // 直接抛错让调用方立即失败。无 yield 是有意的，豁免 require-yield。
-  // eslint-disable-next-line require-yield
-  async *analyze(_input: RuntimeTaskInput): AsyncIterable<RuntimeEvent> {
-    throw new OmpUnavailableError();
-  }
-  // eslint-disable-next-line require-yield
-  async *develop(_input: RuntimeTaskInput): AsyncIterable<RuntimeEvent> {
-    throw new OmpUnavailableError();
-  }
-  async review(_input: ReviewTaskInput): Promise<ReviewResult> {
-    throw new OmpUnavailableError();
-  }
-  async cancel(_runId: string): Promise<void> {
-    throw new OmpUnavailableError();
-  }
-}
-
-/** 命令被治理策略拒绝时抛出（P1-03）。 */
+/** 命令被治理策略拒绝时抛出（P1-03）。LocalCommandAdapter 与 OmpAdapter 共享。 */
 export class PolicyDeniedError extends Error {
   constructor(
     public readonly deniedAction: string,

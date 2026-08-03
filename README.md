@@ -2,7 +2,7 @@
 
 > 证据驱动的本地 Git 仓库修复平台。
 >
-> 本仓库已完成 Phase 0、Phase 1、Phase 2（SQLite、Fake 闭环与评测基准）与 **Phase 3（Git 与证据）** 的独立验收。完整规格见 [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md)，各阶段验收结论见 [`docs/reviews/`](docs/reviews/)，开发规则见 [`AGENTS.md`](AGENTS.md)。
+> 本仓库已完成 Phase 0、Phase 1、Phase 2（SQLite、Fake 闭环与评测基准）、**Phase 3（Git 与证据）** 和 **Phase 4（真实修复闭环）** 的独立验收。Phase 4 已于 2026-08-03 由用户指定的最终独立 Reviewer 正式签发，完整证据与不可回退边界见 [`docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md) 第 21 节。完整规格见 [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md)，各阶段验收结论见 [`docs/reviews/`](docs/reviews/)，开发规则见 [`AGENTS.md`](AGENTS.md)。
 
 ## 一、项目简介
 
@@ -33,7 +33,7 @@ CREATED → INTAKING → GATHERING_EVIDENCE → PLANNED
 | 持久化 | SQLite + Drizzle ORM（Phase 2 已接入；见 [ADR-005](docs/adr/ADR-005-sqlite-runtime.md)） |
 | Git | `LocalGitAdapter`（Phase 3 已接入；经 `ProcessRunner` + `CommandPolicy` + `PathPolicy` 治理，见 [ADR-002](docs/adr/ADR-002-worktree-and-command-safety.md)） |
 | 测试 | Vitest（单元 / 契约 / 集成） |
-| Runtime | MVP 用 `LocalCommandAdapter`；Phase 4 替换为真实 `OmpAdapter`（见 [ADR-001](docs/adr/ADR-001-runtime-boundary.md)） |
+| Runtime | MVP 的降级/测试路径使用 `LocalCommandAdapter`；Phase 4 已验收的真实修复路径使用受治理 `OmpAdapter`，模型写入必须经过 `LocalControlledFileWriter`（见 [ADR-007](docs/adr/ADR-007-omp-adapter-spike-and-design.md) 与 [Phase 4 验收报告](docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md)） |
 
 依赖方向：`apps → orchestrator → core → ports`。Core 零外部 SDK 导入（不依赖 Fastify / React / Drizzle / Git SDK / Pi SDK）。
 
@@ -48,11 +48,13 @@ tracepilot/
 │   ├── reviews/                       # 各阶段验收报告
 │   │   ├── PHASE-1-ACCEPTANCE-REVIEW.md
 │   │   ├── PHASE-2-ACCEPTANCE-REVIEW.md
-│   │   └── PHASE-3-ACCEPTANCE-REVIEW.md  # Phase 3 独立验收报告
+│   │   ├── PHASE-3-ACCEPTANCE-REVIEW.md  # Phase 3 独立验收报告
+│   │   └── PHASE-4-ACCEPTANCE-REVIEW.md  # Phase 4 最终独立验收与签发报告
 │   └── adr/
 │       ├── ADR-001-runtime-boundary.md   # Runtime 边界决策
 │       ├── ADR-002-worktree-and-command-safety.md  # Worktree 受控根目录与命令安全（Phase 3）
-│       └── ADR-005-sqlite-runtime.md     # SQLite 运行时约束
+│       ├── ADR-005-sqlite-runtime.md     # SQLite 运行时约束
+│       └── ADR-007-omp-adapter-spike-and-design.md  # OmpAdapter 边界与演进记录
 ├── package.json / pnpm-workspace.yaml # workspace 配置（engineStrict）
 ├── tsconfig.base.json                 # strict TS 基线
 ├── packages/
@@ -110,6 +112,14 @@ Phase 2 独立验收时的测试统计（Node 24 环境复验，作为历史基�
 > 上述数字已由独立 Reviewer 在 Node 24 环境复验通过。完整命令和验收范围见 [`docs/reviews/PHASE-2-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-2-ACCEPTANCE-REVIEW.md)。
 
 Phase 3 在 Phase 2 基础上新增了 `LocalGitAdapter`、`git-parsers`、`EvidenceRouter`、受控 WorktreeManager、证据/Pack 编排、`git-adapter-contract` 契约测试与真实 Git 集成测试。该阶段已由独立 Reviewer 验收通过；完整测试统计、P1 修复历史和后续不可回退边界见 [`docs/reviews/PHASE-3-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-3-ACCEPTANCE-REVIEW.md)。
+
+Phase 4 最终独立验收结果（2026-08-03）：本地回归 717 项通过、3 项按设计跳过，类型检查、Lint、构建和差异检查通过；29 项受控写入器测试覆盖真实路径、链接逃逸和 TOCTOU。经用户明确授权后，Python 与 JavaScript 两个合成失败仓库均由真实 Omp + DeepSeek 完成初始失败确认、analyze、受控修改、验证、Diff 和 review，严格验收命令 2 项通过。完整签发记录见 [`docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md) 第 21 节。
+
+真实模型验收不会被普通测试隐式触发；只有在 Omp、DeepSeek 凭据和 Python/pytest 前置条件齐全，并已取得外部模型调用授权时才运行：
+
+```powershell
+pnpm test:omp-real
+```
 
 ### 5.2 单独跑某个包
 
@@ -233,9 +243,9 @@ Invoke-WebRequest "http://127.0.0.1:7431/tasks/$taskId/transition" -Method POST 
 
 详见 [ADR-001](docs/adr/ADR-001-runtime-boundary.md)：
 
-- 本机未安装 `omp` 二进制，无法执行真实 `OmpAdapter` Spike。
-- 按规格 Phase 0 退出条件，落地 `LocalCommandAdapter` 作为 MVP Runtime，`RuntimeAdapter` 接口保持不变。
-- Phase 4 必须重试真实 `OmpAdapter` Spike；在此之前 `LocalCommandAdapter` 不得作为 Resume Release 演示的唯一 Runtime。
+- 本节记录 ADR-001 的历史降级决策；Phase 4 已由 ADR-007 接续 OmpAdapter 实现。
+- `LocalCommandAdapter` 仍只可用于 Spike、测试或明确记录的降级模式，不能替代真实 Runtime 的发布演示。
+- Phase 4 已于 2026-08-03 正式独立验收通过；生产真实修复路径可使用受治理 `OmpAdapter`，但不得回退受控写入器、真实路径与 `Plan.allowedPaths` 校验、凭据隔离、服务端 Diff/验证来源及取消边界。
 
 ### Phase 2 SQLite 运行时约束
 
@@ -263,6 +273,6 @@ Invoke-WebRequest "http://127.0.0.1:7431/tasks/$taskId/transition" -Method POST 
 | --- | --- | --- |
 | Phase 2 | SQLite + Drizzle 持久化、契约测试套件、8 个固定基准任务 | 已独立验收通过 |
 | Phase 3 | 真实 Git worktree 创建/回收/Diff/历史/Blame、EvidenceRouter、Pack v1/v(n+1) 编排、契约测试、两个样例仓库集成测试、ADR-002 | 已独立验收通过 |
-| Phase 4 | 真实 `OmpAdapter` Spike（安装 `omp` 后） | 未开始 |
+| Phase 4 | 真实 `OmpAdapter`、受控修复/验证/Diff/Review 闭环 | 已于 2026-08-03 独立验收通过；P1 全部关闭 |
 | Phase 5 | 真实 Reviewer、Repair Memory 召回 | 未开始 |
 | Phase 6+ | Dashboard、SAG（后置） | 未开始 |

@@ -12,11 +12,14 @@ export * from "./domain/evidence.js";
 export * from "./domain/repair-record.js";
 export * from "./domain/audit.js";
 export * from "./domain/agent-run.js";
+export * from "./domain/execution-result.js";
 
 // 端口（仅接口 —— 实现在 packages/adapters、packages/store）
 export * from "./ports/adapters.js";
 export * from "./ports/repositories.js";
 export * from "./ports/policies.js";
+export * from "./ports/worktree-filesystem-guard.js";
+export * from "./ports/controlled-file-writer.js";
 
 // 内存仓储（Phase 1 单元测试兜底实现）
 export * from "./repositories/in-memory.js";
@@ -26,3 +29,4 @@ export * from "./services/task-orchestrator.js";
 export * from "./services/evidence-router.js";
 export * from "./services/worktree-manager.js";
 export * from "./services/evidence-collector.js";
+export * from "./services/execution-orchestrator.js";

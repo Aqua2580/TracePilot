@@ -33,7 +33,8 @@ export class LocalProcessRunner implements ProcessRunner {
   async run(
     spec: CommandSpec,
     cwd: string,
-    policy: ProcessPolicy
+    policy: ProcessPolicy,
+    abortSignal?: AbortSignal
   ): Promise<CommandResult> {
     // 1. 校验 cwd 位于某个允许根目录内。
     if (!isAbsolute(cwd)) {
@@ -60,11 +61,15 @@ export class LocalProcessRunner implements ProcessRunner {
     }
 
     // 2. 除非 inheritEnv=true，否则用干净环境启动。纵深防御：避免泄漏密钥。
+    //    P4：当 inheritEnv=false 但 allowedEnvVarNames 提供时，仅透传白名单
+    //    变量（用于 OmpAdapter 把 ANTHROPIC_API_KEY 等 LLM 凭据传给 omp 子进程，
+    //    不泄漏其他敏感变量）。白名单只声明名称，值从 process.env 读取。
     const argv = [...spec.argv];
     const startedAt = new Date().toISOString();
+    const childEnv = buildChildEnv(policy);
     const child = spawn(argv[0]!, argv.slice(1), {
       cwd: resolvedCwd,
-      env: policy.inheritEnv ? { ...process.env } : { PATH: process.env.PATH ?? "" },
+      env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
       shell: false
     });
@@ -117,14 +122,33 @@ export class LocalProcessRunner implements ProcessRunner {
       killProcessTree(child);
     }, spec.timeoutMs);
 
+    // P1-05：取消信号。当 abortSignal 被 abort 时，终止整个进程树。
+    // 与超时不同，取消是调用方主动发起（如 OmpAdapter.cancel），
+    // 返回结果中 timedOut=false 但 exitCode 非 0。
+    let aborted = false;
+    const onAbort = (): void => {
+      aborted = true;
+      killProcessTree(child);
+    };
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        // 已取消：在 spawn 后立即终止
+        onAbort();
+      } else {
+        abortSignal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
+
     const exitCode: number = await new Promise((resolveP, rejectP) => {
       child.on("error", (err) => {
         clearTimeout(timer);
+        if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
         rejectP(err);
       });
       child.on("close", (code) => {
         clearTimeout(timer);
-        resolveP(code ?? (timedOut ? 124 : 0));
+        if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
+        resolveP(code ?? (timedOut ? 124 : aborted ? 130 : 0));
       });
     });
 
@@ -182,3 +206,47 @@ function isInside(candidate: string, root: string): boolean {
   const rel = relative(root, candidate);
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
+
+/**
+ * 构造子进程环境变量（P4：白名单透传；P1-02：凭据防护）。
+ *
+ * - `inheritEnv=true`：全量透传 `process.env`（向后兼容 Phase 1-3 行为，
+ *   仅用于不含凭据的场景）。
+ * - `inheritEnv=false` + `allowedEnvVarNames`：仅透传白名单变量 + `PATH`。
+ *   用于 OmpAdapter 把 LLM 凭据（如 `ANTHROPIC_API_KEY`）传给 omp 子进程，
+ *   不泄漏其他敏感变量。白名单变量不存在时静默跳过。
+ * - `inheritEnv=false` 且无白名单：仅 `PATH`（Phase 1-3 默认行为）。
+ *
+ * P1-02 纵深防御：当 `disallowCredentialVars=true` 时，即使白名单含凭据
+ * 变量名（匹配 `API_KEY|TOKEN|SECRET|CREDENTIAL|PASSWORD|PRIVATE_KEY`
+ * 模式）也拒绝透传。用于验证命令场景（pnpm test / pytest 等）：Developer
+ * 可修改 worktree 中的测试脚本，若验证子进程能读到 LLM API key，恶意测试
+ * 可外传凭据。
+ *
+ * omp 子进程的 processPolicy 必须设 `disallowCredentialVars=false`（或不设），
+ * 否则 omp 拿不到 LLM 凭据无法调用模型。这与验证命令的纵深防御互不冲突。
+ */
+function buildChildEnv(policy: ProcessPolicy): NodeJS.ProcessEnv {
+  if (policy.inheritEnv) {
+    return { ...process.env };
+  }
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? "" };
+  const allowList = policy.allowedEnvVarNames;
+  // P1-02：验证命令场景下，凭据变量名即使在白名单中也拒绝透传
+  const blockCredentials = policy.disallowCredentialVars === true;
+  if (allowList && allowList.length > 0) {
+    for (const name of allowList) {
+      if (blockCredentials && CREDENTIAL_PATTERN.test(name)) {
+        continue;
+      }
+      const value = process.env[name];
+      if (value !== undefined) {
+        env[name] = value;
+      }
+    }
+  }
+  return env;
+}
+
+/** 凭据变量名模式（P1-02 纵深防御）。 */
+const CREDENTIAL_PATTERN = /(?:API_KEY|TOKEN|SECRET|CREDENTIAL|PASSWORD|PRIVATE_KEY)/i;

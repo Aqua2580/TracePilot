@@ -187,7 +187,10 @@ async function runBenchmarkChain(
     allowedPaths: ["src/**"],
     evidencePackId: `pack-${fixture.id}`,
     evidencePackVersion: 1,
-    taskInput: fixture.taskInput
+    taskInput: fixture.taskInput,
+    projectCommands: {
+      test: { argv: ["pnpm", "test"], timeoutMs: 60000 }
+    }
   };
   let eventCount = 0;
   let lastRunId: string | undefined;

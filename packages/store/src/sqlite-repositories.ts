@@ -24,6 +24,7 @@ import {
 import type { RepairRecord, VerificationSummary, ReviewSummary, ReviewFinding } from "@tracepilot/core";
 import type { AuditEvent, AuditEventType, OutputTruncation } from "@tracepilot/core";
 import type { AgentRunRecord } from "@tracepilot/core";
+import type { ExecutionResult } from "@tracepilot/core";
 import type { RuntimeEvent } from "@tracepilot/core";
 import type { Worktree } from "@tracepilot/core";
 import type {
@@ -37,6 +38,7 @@ import type {
   RepairRecordRepository,
   AuditRepository,
   AgentRunRepository,
+  ExecutionResultRepository,
   TransactionalRepos
 } from "@tracepilot/core";
 
@@ -55,6 +57,7 @@ export class SqliteRepositories implements TransactionalRepos {
   readonly repairRecords: RepairRecordRepository;
   readonly audit: AuditRepository;
   readonly agentRuns: AgentRunRepository;
+  readonly executionResults: ExecutionResultRepository;
 
   constructor(private readonly db: DatabaseType) {
     this.projects = new SqliteProjectRepository(db);
@@ -67,6 +70,7 @@ export class SqliteRepositories implements TransactionalRepos {
     this.repairRecords = new SqliteRepairRecordRepository(db);
     this.audit = new SqliteAuditRepository(db);
     this.agentRuns = new SqliteAgentRunRepository(db);
+    this.executionResults = new SqliteExecutionResultRepository(db);
   }
 }
 
@@ -929,6 +933,99 @@ function agentRunFromRow(row: AgentRunRow): AgentRunRecord {
     contentHash: row.content_hash,
     startedAt: row.started_at,
     endedAt: row.ended_at
+  };
+}
+
+// ---------------------------------------------------------------------------
+// ExecutionResult —— P1-03：持久化 runDevelop 的受控 Diff 与验证产物
+// ---------------------------------------------------------------------------
+
+class SqliteExecutionResultRepository implements ExecutionResultRepository {
+  constructor(private readonly db: DatabaseType) {}
+
+  async save(result: ExecutionResult): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO execution_results (
+           id, task_id, run_id, diff_hash, diff_patch, diff_changed_files_json,
+           diff_bytes, verification_exit_code, verification_passed,
+           verification_stdout, verification_stderr, created_at
+         ) VALUES (
+           @id, @taskId, @runId, @diffHash, @diffPatch, @diffChangedFilesJson,
+           @diffBytes, @verificationExitCode, @verificationPassed,
+           @verificationStdout, @verificationStderr, @createdAt
+         )
+         ON CONFLICT(id) DO UPDATE SET
+           diff_hash = @diffHash,
+           diff_patch = @diffPatch,
+           diff_changed_files_json = @diffChangedFilesJson,
+           diff_bytes = @diffBytes,
+           verification_exit_code = @verificationExitCode,
+           verification_passed = @verificationPassed,
+           verification_stdout = @verificationStdout,
+           verification_stderr = @verificationStderr,
+           created_at = @createdAt`
+      )
+      .run({
+        id: result.id,
+        taskId: result.taskId,
+        runId: result.runId,
+        diffHash: result.diffHash,
+        diffPatch: result.diffPatch,
+        diffChangedFilesJson: toJson(result.diffChangedFiles),
+        diffBytes: result.diffBytes,
+        verificationExitCode: result.verificationExitCode,
+        verificationPassed: result.verificationPassed ? 1 : 0,
+        verificationStdout: result.verificationStdout,
+        verificationStderr: result.verificationStderr,
+        createdAt: result.createdAt
+      });
+  }
+
+  async findLatestByTask(taskId: string): Promise<ExecutionResult | undefined> {
+    const row = this.db
+      .prepare("SELECT * FROM execution_results WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
+      .get(taskId) as ExecutionResultRow | undefined;
+    return row ? executionResultFromRow(row) : undefined;
+  }
+
+  async findByTask(taskId: string): Promise<ExecutionResult[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM execution_results WHERE task_id = ? ORDER BY created_at ASC, rowid ASC")
+      .all(taskId) as ExecutionResultRow[];
+    return rows.map(executionResultFromRow);
+  }
+}
+
+interface ExecutionResultRow {
+  id: string;
+  task_id: string;
+  run_id: string;
+  diff_hash: string;
+  diff_patch: string;
+  diff_changed_files_json: string;
+  diff_bytes: number;
+  verification_exit_code: number;
+  verification_passed: number;
+  verification_stdout: string;
+  verification_stderr: string;
+  created_at: string;
+}
+
+function executionResultFromRow(row: ExecutionResultRow): ExecutionResult {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    runId: row.run_id,
+    diffHash: row.diff_hash,
+    diffPatch: row.diff_patch,
+    diffChangedFiles: parseJson<readonly string[]>(row.diff_changed_files_json),
+    diffBytes: row.diff_bytes,
+    verificationExitCode: row.verification_exit_code,
+    verificationPassed: row.verification_passed === 1,
+    verificationStdout: row.verification_stdout,
+    verificationStderr: row.verification_stderr,
+    createdAt: row.created_at
   };
 }
 

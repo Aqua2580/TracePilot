@@ -89,7 +89,9 @@ describe("Fake 适配器 —— Phase 1 冒烟", () => {
         allowedPaths: ["src/**"],
         evidencePackId: "pack-1",
         evidencePackVersion: 1,
-        taskInput: sampleTaskInput()
+        taskInput: sampleTaskInput(),
+      projectCommands: sampleProjectCommands(),
+        projectCommands: sampleProjectCommands()
       })) {
         events.push(ev);
       }
@@ -280,7 +282,8 @@ describe("LocalCommandAdapter（ADR-001 MVP 兜底）", () => {
       allowedPaths: ["src/**"],
       evidencePackId: "pack-1",
       evidencePackVersion: 1,
-      taskInput: sampleTaskInput()
+      taskInput: sampleTaskInput(),
+      projectCommands: sampleProjectCommands()
     })) {
       events.push(ev);
     }
@@ -320,7 +323,8 @@ describe("LocalCommandAdapter（ADR-001 MVP 兜底）", () => {
       allowedPaths: ["src/**"],
       evidencePackId: "pack-1",
       evidencePackVersion: 1,
-      taskInput: sampleTaskInput()
+      taskInput: sampleTaskInput(),
+      projectCommands: sampleProjectCommands()
     })) {
       events.push(ev);
     }
@@ -361,7 +365,9 @@ describe("LocalCommandAdapter（ADR-001 MVP 兜底）", () => {
         allowedPaths: ["src/**"],
         evidencePackId: "pack-1",
         evidencePackVersion: 1,
-        taskInput: sampleTaskInput()
+        taskInput: sampleTaskInput(),
+      projectCommands: sampleProjectCommands(),
+        projectCommands: sampleProjectCommands()
       })) {
         events.push(ev);
       }
@@ -389,7 +395,8 @@ describe("LocalCommandAdapter（ADR-001 MVP 兜底）", () => {
       allowedPaths: ["src/**"],
       evidencePackId: "pack-1",
       evidencePackVersion: 1,
-      taskInput: sampleTaskInput()
+      taskInput: sampleTaskInput(),
+      projectCommands: sampleProjectCommands()
     });
 
     const events: unknown[] = [];
@@ -466,47 +473,314 @@ describe("P2-03 LocalProcessRunner 超时终止子进程", () => {
   });
 });
 
-describe("OmpAdapter stub（ADR-001）", () => {
-  it("analyze 抛 OmpUnavailableError", async () => {
-    const omp = new OmpAdapter();
-    const iter = omp.analyze({
-      taskId: "t1",
-      worktreePath: "/wt",
-      allowedPaths: [],
-      evidencePackId: "p",
-      evidencePackVersion: 1,
-      taskInput: sampleTaskInput()
-    });
-    await expect(async () => {
-      for await (const _ev of iter) void _ev;
-    }).rejects.toBeInstanceOf(OmpUnavailableError);
+// ---------------------------------------------------------------------------
+// P1-05：LocalProcessRunner 支持 AbortSignal 取消进程树
+// ---------------------------------------------------------------------------
+
+describe("P1-05：LocalProcessRunner 支持 AbortSignal 取消进程树", () => {
+  it("abortSignal 在进程运行期间被 abort 时，进程被终止且 exitCode 非 0", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tracepilot-p1-05-abort-"));
+    try {
+      const runner = new LocalProcessRunner();
+      const controller = new AbortController();
+      // 启动一个会运行 60 秒的进程
+      const runPromise = runner.run(
+        {
+          argv: ["node", "-e", "setTimeout(()=>{}, 60000)"],
+          timeoutMs: 60000
+        },
+        tmpDir,
+        {
+          timeoutMs: 60000,
+          maxOutputBytes: 1024,
+          allowedCwdRoots: [tmpDir],
+          inheritEnv: true
+        },
+        controller.signal
+      );
+      // 等待一小段时间确保进程已启动
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      controller.abort();
+      const result = await runPromise;
+      // 进程应被终止，exitCode 非 0
+      expect(result.exitCode).not.toBe(0);
+      // 不是超时导致的终止
+      expect(result.timedOut).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
-  it("review 抛 OmpUnavailableError", async () => {
-    const omp = new OmpAdapter();
+  it("已 abort 的 abortSignal 传入时，进程立即被终止", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tracepilot-p1-05-preaborted-"));
+    try {
+      const runner = new LocalProcessRunner();
+      const controller = new AbortController();
+      controller.abort(); // 在调用 run 之前就 abort
+      const result = await runner.run(
+        {
+          argv: ["node", "-e", "setTimeout(()=>{}, 60000)"],
+          timeoutMs: 60000
+        },
+        tmpDir,
+        {
+          timeoutMs: 60000,
+          maxOutputBytes: 1024,
+          allowedCwdRoots: [tmpDir],
+          inheritEnv: true
+        },
+        controller.signal
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.timedOut).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("未提供 abortSignal 时行为与 Phase 1-3 一致", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tracepilot-p1-05-nosignal-"));
+    try {
+      const runner = new LocalProcessRunner();
+      const result = await runner.run(
+        {
+          argv: ["node", "-e", "process.stdout.write('ok')"],
+          timeoutMs: 10000
+        },
+        tmpDir,
+        {
+          timeoutMs: 10000,
+          maxOutputBytes: 1024,
+          allowedCwdRoots: [tmpDir],
+          inheritEnv: true
+        }
+        // 不传 abortSignal
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("ok");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1-02：验证命令环境不泄漏凭据
+// ---------------------------------------------------------------------------
+
+describe("P1-02：LocalProcessRunner 凭据防护（disallowCredentialVars）", () => {
+  it("disallowCredentialVars=true 时，白名单中的凭据变量被过滤", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tracepilot-p1-02-block-"));
+    try {
+      // 设置哨兵凭据值
+      process.env.TRACEPILOT_TEST_API_KEY = "secret-sentinel-value";
+      process.env.TRACEPILOT_TEST_TOKEN = "token-sentinel-value";
+      // 注意：变量名不得含 API_KEY|TOKEN|SECRET|CREDENTIAL|PASSWORD|PRIVATE_KEY
+      process.env.TRACEPILOT_TEST_HARMLESS = "non-secret-value";
+
+      const runner = new LocalProcessRunner();
+      // 即使白名单含凭据变量名，disallowCredentialVars=true 也应过滤
+      const result = await runner.run(
+        {
+          // node 脚本读取环境变量并输出
+          argv: ["node", "-e", "process.stdout.write(JSON.stringify({apiKey: process.env.TRACEPILOT_TEST_API_KEY, token: process.env.TRACEPILOT_TEST_TOKEN, harmless: process.env.TRACEPILOT_TEST_HARMLESS}))"],
+          timeoutMs: 10000
+        },
+        tmpDir,
+        {
+          timeoutMs: 10000,
+          maxOutputBytes: 64 * 1024,
+          allowedCwdRoots: [tmpDir],
+          inheritEnv: false,
+          // 白名单故意包含凭据变量，测试 disallowCredentialVars 的纵深防御
+          allowedEnvVarNames: ["TRACEPILOT_TEST_API_KEY", "TRACEPILOT_TEST_TOKEN", "TRACEPILOT_TEST_HARMLESS"],
+          disallowCredentialVars: true
+        }
+      );
+      const output = JSON.parse(result.stdout);
+      // 凭据变量应被过滤（undefined）
+      expect(output.apiKey).toBeUndefined();
+      expect(output.token).toBeUndefined();
+      // 非凭据变量应正常透传
+      expect(output.harmless).toBe("non-secret-value");
+    } finally {
+      delete process.env.TRACEPILOT_TEST_API_KEY;
+      delete process.env.TRACEPILOT_TEST_TOKEN;
+      delete process.env.TRACEPILOT_TEST_HARMLESS;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("disallowCredentialVars=false 时，白名单中的凭据变量正常透传（omp 场景）", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tracepilot-p1-02-allow-"));
+    try {
+      process.env.TRACEPILOT_TEST_API_KEY = "omp-needs-this-key";
+
+      const runner = new LocalProcessRunner();
+      const result = await runner.run(
+        {
+          argv: ["node", "-e", "process.stdout.write(process.env.TRACEPILOT_TEST_API_KEY || 'undefined')"],
+          timeoutMs: 10000
+        },
+        tmpDir,
+        {
+          timeoutMs: 10000,
+          maxOutputBytes: 1024,
+          allowedCwdRoots: [tmpDir],
+          inheritEnv: false,
+          allowedEnvVarNames: ["TRACEPILOT_TEST_API_KEY"],
+          // omp 场景：disallowCredentialVars 不设或 false，允许凭据透传
+          disallowCredentialVars: false
+        }
+      );
+      // omp 子进程需要 LLM API key，应能读到
+      expect(result.stdout).toBe("omp-needs-this-key");
+    } finally {
+      delete process.env.TRACEPILOT_TEST_API_KEY;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("inheritEnv=false 且无白名单时，仅 PATH 可用（Phase 1-3 默认行为）", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tracepilot-p1-02-default-"));
+    try {
+      process.env.TRACEPILOT_TEST_SECRET = "should-not-leak";
+
+      const runner = new LocalProcessRunner();
+      const result = await runner.run(
+        {
+          argv: ["node", "-e", "process.stdout.write(process.env.TRACEPILOT_TEST_SECRET || 'undefined')"],
+          timeoutMs: 10000
+        },
+        tmpDir,
+        {
+          timeoutMs: 10000,
+          maxOutputBytes: 1024,
+          allowedCwdRoots: [tmpDir],
+          inheritEnv: false
+          // 无 allowedEnvVarNames，无 disallowCredentialVars
+        }
+      );
+      // 无白名单时只有 PATH，凭据变量读不到
+      expect(result.stdout).toBe("undefined");
+    } finally {
+      delete process.env.TRACEPILOT_TEST_SECRET;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("OmpAdapter（ADR-007 真实实现，不依赖 LLM API key）", () => {
+  // 这些冒烟测试验证 OmpAdapter 的基础形状与治理边界。真实 omp 调用
+  // 闭环（analyze/develop/review 通过 omp + LLM 完成）待 API key 配置
+  // 后由专门集成测试覆盖，见 ADR-007 §待解决问题。
+  //
+  // 使用字符串前缀 PathPolicy（不调用 realpathSync），因为冒烟测试用
+  // `/fake/wt` 这种不存在路径。PathPolicy 真实行为由 governance 包测试。
+  class FakeStringPathPolicy {
+    decide(unresolvedPath: string, roots: readonly string[]) {
+      if (!unresolvedPath) return { allowed: false, reason: "empty" };
+      for (const root of roots) {
+        if (unresolvedPath === root ||
+            unresolvedPath.startsWith(root + "/") ||
+            unresolvedPath.startsWith(root + "\\")) {
+          return { allowed: true, reason: "inside", resolvedPath: unresolvedPath };
+        }
+      }
+      return { allowed: false, reason: "outside roots" };
+    }
+  }
+  function makeOmpAdapter(opts: {
+    allowedRoots?: readonly string[];
+    processRunner?: FakeProcessRunner;
+    ompPath?: string;
+    model?: string;
+    extraReadonlyDirs?: readonly string[];
+  }) {
+    const roots = opts.allowedRoots ?? ["/fake/wt"];
+    return new OmpAdapter({
+      processRunner: opts.processRunner ?? new FakeProcessRunner(),
+      pathPolicy: new FakeStringPathPolicy() as unknown as import("@tracepilot/core").PathPolicy,
+      processPolicy: sampleProcessPolicy(roots),
+      projectCommands: sampleProjectCommands(),
+      allowedWorktreeRoots: roots,
+      ompPath: opts.ompPath ?? "/fake/omp",
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.extraReadonlyDirs ? { extraReadonlyDirs: opts.extraReadonlyDirs } : {})
+    });
+  }
+
+  it("cancel 对未知 runId 调用安全（不抛错）", async () => {
+    const omp = makeOmpAdapter({});
+    await expect(omp.cancel("unknown-run-id")).resolves.toBeUndefined();
+  });
+
+  it("analyze 在 worktree 路径越界时产出 error 且不调用 ProcessRunner", async () => {
+    const runner = new FakeProcessRunner();
+    const omp = makeOmpAdapter({
+      allowedRoots: ["/allowed/wt"],
+      processRunner: runner
+    });
+    const events: unknown[] = [];
+    for await (const ev of omp.analyze({
+      taskId: "t1",
+      worktreePath: "/outside/wt",
+      allowedPaths: ["src/**"],
+      evidencePackId: "pack-1",
+      evidencePackVersion: 1,
+      taskInput: sampleTaskInput(),
+      projectCommands: sampleProjectCommands()
+    })) {
+      events.push(ev);
+    }
+    const types = events.map((e) => (e as { type: string }).type);
+    expect(types).toContain("error");
+    expect(types).not.toContain("completed");
+    expect(runner.getInvocations()).toHaveLength(0);
+  });
+
+  it("review 在 omp 退出码非零时抛 OmpUnavailableError", async () => {
+    // 用 stub ProcessRunner 避免 FakeProcessRunner 的完整 argv key 匹配问题。
+    // OmpAdapter 构造的 argv 包含 prompt 作为最后一个元素，key 难以预测。
+    let invoked = 0;
+    const stubRunner = {
+      async run() {
+        invoked++;
+        return {
+          argv: ["/fake/omp"],
+          cwd: "/fake/wt",
+          exitCode: 2,
+          stdout: "",
+          stderr: "omp: API key missing",
+          truncated: false,
+          originalBytes: 0,
+          retainedBytes: 0,
+          timedOut: false,
+          startedAt: "2026-07-27T00:00:00.000Z",
+          endedAt: "2026-07-27T00:00:00.000Z"
+        };
+      }
+    };
+    const omp = makeOmpAdapter({ processRunner: stubRunner as unknown as FakeProcessRunner });
     await expect(
       omp.review({
         taskId: "t1",
-        worktreePath: "/wt",
-        evidencePackId: "p",
+        worktreePath: "/fake/wt",
+        evidencePackId: "pack-1",
         evidencePackVersion: 1,
-        taskInput: sampleTaskInput(),
+        taskInput: { ...sampleTaskInput(), acceptanceCriteria: ["c1"] },
         diff: {
-          worktreePath: "/wt",
-          patch: "",
-          hash: "",
-          changedFiles: [],
-          bytes: 0
+          worktreePath: "/fake/wt",
+          patch: "diff",
+          hash: "h",
+          changedFiles: ["src/foo.ts"],
+          bytes: 4
         },
         verificationResult: {},
-        acceptanceCriteria: []
+        acceptanceCriteria: ["c1"]
       })
     ).rejects.toBeInstanceOf(OmpUnavailableError);
-  });
-
-  it("cancel 抛 OmpUnavailableError", async () => {
-    const omp = new OmpAdapter();
-    await expect(omp.cancel("any")).rejects.toBeInstanceOf(OmpUnavailableError);
+    expect(invoked).toBe(1);
   });
 });
 

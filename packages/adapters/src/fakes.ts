@@ -53,11 +53,34 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
   private readonly cancelled = new Set<string>();
   constructor(private readonly behaviour: FakeRuntimeBehaviour = {}) {}
 
-  async *analyze(input: RuntimeTaskInput): AsyncIterable<RuntimeEvent> {
+  async *analyze(input: RuntimeTaskInput, signal?: AbortSignal): AsyncIterable<RuntimeEvent> {
     const runId = randomId("run");
     this.runs.add(runId);
     const at = new Date().toISOString();
+
+    // P1-R02：signal 在 started 前 aborted → 直接 yield error，不启动 Runtime。
+    if (signal?.aborted) {
+      yield { type: "started", runId, taskId: input.taskId, at };
+      yield {
+        type: "error",
+        runId,
+        at: new Date().toISOString(),
+        message: "cancelled before analyze start (signal aborted)"
+      };
+      return;
+    }
+
     yield { type: "started", runId, taskId: input.taskId, at };
+
+    if (signal?.aborted) {
+      yield {
+        type: "error",
+        runId,
+        at: new Date().toISOString(),
+        message: "cancelled during analyze (signal aborted after start)"
+      };
+      return;
+    }
 
     if (this.behaviour.analyzeError) {
       yield {
@@ -82,18 +105,32 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
     };
   }
 
-  async *develop(input: RuntimeTaskInput): AsyncIterable<RuntimeEvent> {
+  async *develop(input: RuntimeTaskInput, signal?: AbortSignal): AsyncIterable<RuntimeEvent> {
     const runId = randomId("run");
     this.runs.add(runId);
+
+    // P1-R02：signal 在 started 前 aborted → 直接 yield error，不启动 Runtime。
+    if (signal?.aborted) {
+      yield { type: "started", runId, taskId: input.taskId, at: new Date().toISOString() };
+      yield {
+        type: "error",
+        runId,
+        at: new Date().toISOString(),
+        message: "cancelled before develop start (signal aborted)"
+      };
+      return;
+    }
+
     yield { type: "started", runId, taskId: input.taskId, at: new Date().toISOString() };
     const n = this.behaviour.developProgressEvents ?? 1;
     for (let i = 0; i < n; i++) {
-      if (this.cancelled.has(runId)) {
+      // P1-R02：检查外部 signal 和内部 cancel 标记
+      if (signal?.aborted || this.cancelled.has(runId)) {
         yield {
           type: "error",
           runId,
           at: new Date().toISOString(),
-          message: "cancelled"
+          message: signal?.aborted ? "cancelled (signal aborted)" : "cancelled"
         };
         return;
       }
@@ -112,7 +149,11 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
     };
   }
 
-  async review(input: ReviewTaskInput): Promise<ReviewResult> {
+  async review(input: ReviewTaskInput, signal?: AbortSignal): Promise<ReviewResult> {
+    // P1-R02：signal 在 review 前/中 aborted → 抛 AbortError
+    if (signal?.aborted) {
+      throw new Error("review cancelled (signal aborted)");
+    }
     return {
       verdict: this.behaviour.reviewVerdict ?? "ship",
       findings: this.behaviour.reviewFindings ?? [],
@@ -181,6 +222,7 @@ export class FakeKnowledgeAdapter implements KnowledgeAdapter {
 export class FakeGitAdapter implements GitAdapter {
   private readonly worktrees = new Map<string, Worktree>();
   private readonly diffPatches = new Map<string, string>();
+  private readonly changedFilesOverrides = new Map<string, string[]>();
   private readonly historyMap = new Map<string, GitEvidence[]>();
   private readonly blameMap = new Map<string, BlameEvidence[]>();
   private repositoryInfoOverride: RepositoryInfo | undefined;
@@ -216,11 +258,12 @@ export class FakeGitAdapter implements GitAdapter {
   }
   async getDiff(worktreePath: string): Promise<DiffArtifact> {
     const patch = this.diffPatches.get(worktreePath) ?? "";
+    const override = this.changedFilesOverrides.get(worktreePath);
     return {
       worktreePath,
       patch,
       hash: `sha256-${patch.length}`,
-      changedFiles: patch ? ["src/fake.ts"] : [],
+      changedFiles: override ?? (patch ? ["src/fake.ts"] : []),
       bytes: patch.length
     };
   }
@@ -254,6 +297,15 @@ export class FakeGitAdapter implements GitAdapter {
   /** 仅用于测试的辅助方法，用于控制 getDiff 输出。 */
   setDiff(worktreePath: string, patch: string): void {
     this.diffPatches.set(worktreePath, patch);
+  }
+  /**
+   * 仅用于测试的辅助方法，覆盖 getDiff 返回的 changedFiles。
+   *
+   * 用于 P1-R01 路径范围越界测试：让 FakeGitAdapter 返回不在
+   * Plan.allowedPaths 内的变更路径，验证 runDevelop 的核心层校验。
+   */
+  setChangedFiles(worktreePath: string, changedFiles: string[]): void {
+    this.changedFilesOverrides.set(worktreePath, changedFiles);
   }
   /** 仅用于测试的辅助方法，注入 getHistory 返回的数据。 */
   setHistory(history: GitEvidence[]): void {

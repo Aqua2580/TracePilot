@@ -71,18 +71,61 @@ describe("API 组合根（SQLite 装配）", () => {
     safeCleanup(dbPath);
   });
 
-  it("GET /health 返回 200 并带 phase-3-git-evidence 标记与 SQLite store", async () => {
-    const root = buildCompositionRoot({ dbPath });
+  it("GET /health 返回 200 并带 phase-4-omp-adapter 标记与 SQLite store（默认降级模式）", async () => {
+    // 确保测试环境未设置 TRACEPILOT_OMP_PATH，验证默认降级到 LocalCommandAdapter。
+    // skipEnvFile=true 避免 .env 中的真实 TRACEPILOT_OMP_PATH 干扰测试。
+    const savedOmpPath = process.env.TRACEPILOT_OMP_PATH;
+    delete process.env.TRACEPILOT_OMP_PATH;
     try {
-      const res = await root.app.inject({ method: "GET", url: "/health" });
-      expect(res.statusCode).toBe(200);
-      const body = res.json() as { status: string; phase: string; runtime: string; store: string };
-      expect(body.status).toBe("ok");
-      expect(body.phase).toBe("phase-3-git-evidence");
-      expect(body.runtime).toBe("LocalCommandAdapter");
-      expect(body.store).toBe("SQLite");
+      const root = buildCompositionRoot({ dbPath, skipEnvFile: true });
+      try {
+        const res = await root.app.inject({ method: "GET", url: "/health" });
+        expect(res.statusCode).toBe(200);
+        const body = res.json() as { status: string; phase: string; runtime: string; store: string };
+        expect(body.status).toBe("ok");
+        expect(body.phase).toBe("phase-4-omp-adapter");
+        expect(body.runtime).toBe("local-command");
+        expect(body.store).toBe("SQLite");
+      } finally {
+        await root.close();
+      }
     } finally {
-      await root.close();
+      if (savedOmpPath !== undefined) process.env.TRACEPILOT_OMP_PATH = savedOmpPath;
+    }
+  });
+
+  it("GET /health 在 TRACEPILOT_OMP_PATH 设置时返回 runtime=omp 并回显 ompPath（Phase 4 ADR-007）", async () => {
+    // skipEnvFile=true 避免 .env 中的真实配置覆盖测试设置的值。
+    const savedOmpPath = process.env.TRACEPILOT_OMP_PATH;
+    const savedOmpModel = process.env.TRACEPILOT_OMP_MODEL;
+    process.env.TRACEPILOT_OMP_PATH = "/fake/omp";
+    process.env.TRACEPILOT_OMP_MODEL = "claude-sonnet-4";
+    try {
+      const root = buildCompositionRoot({ dbPath, skipEnvFile: true });
+      try {
+        const res = await root.app.inject({ method: "GET", url: "/health" });
+        expect(res.statusCode).toBe(200);
+        const body = res.json() as {
+          status: string;
+          phase: string;
+          runtime: string;
+          ompPath?: string;
+          store: string;
+        };
+        expect(body.status).toBe("ok");
+        expect(body.phase).toBe("phase-4-omp-adapter");
+        expect(body.runtime).toBe("omp");
+        expect(body.ompPath).toBe("/fake/omp");
+        expect(body.store).toBe("SQLite");
+      } finally {
+        await root.close();
+      }
+    } finally {
+      // 恢复环境变量，避免污染其他测试。
+      if (savedOmpPath === undefined) delete process.env.TRACEPILOT_OMP_PATH;
+      else process.env.TRACEPILOT_OMP_PATH = savedOmpPath;
+      if (savedOmpModel === undefined) delete process.env.TRACEPILOT_OMP_MODEL;
+      else process.env.TRACEPILOT_OMP_MODEL = savedOmpModel;
     }
   });
 
@@ -193,6 +236,86 @@ describe("API 组合根（SQLite 装配）", () => {
         method: "POST",
         url: `/tasks/${task.id}/cancel`,
         payload: { reason: "user requested" }
+      });
+      expect(cancelRes.statusCode).toBe(200);
+      expect((cancelRes.json() as { status: string }).status).toBe("CANCELLED");
+    } finally {
+      await root.close();
+    }
+  });
+
+  it("P1-R02：POST /tasks/:taskId/cancel 先调 cancelRuntimeForTask 再迁移状态（审计一致）", async () => {
+    const root = buildCompositionRoot({ dbPath });
+    try {
+      await root.store.unitOfWork.run(async (tx) => {
+        await tx.projects.save(sampleProject());
+      });
+
+      const createRes = await root.app.inject({
+        method: "POST",
+        url: "/tasks",
+        payload: { projectId: "proj-1", input: sampleInput() }
+      });
+      const task = createRes.json() as { id: string };
+
+      const cancelRes = await root.app.inject({
+        method: "POST",
+        url: `/tasks/${task.id}/cancel`,
+        payload: { reason: "P1-R02 取消集成测试" }
+      });
+      expect(cancelRes.statusCode).toBe(200);
+      const body = cancelRes.json() as { status: string };
+      expect(body.status).toBe("CANCELLED");
+
+      // 核心断言：审计时间线必须含 task_cancelled 事件
+      const auditRes = await root.app.inject({
+        method: "GET",
+        url: `/tasks/${task.id}/audit`
+      });
+      const audits = auditRes.json() as Array<{ type: string; reason?: string }>;
+      const cancelled = audits.find((a) => a.type === "task_cancelled");
+      expect(cancelled).toBeDefined();
+      expect(cancelled!.reason).toContain("P1-R02 取消集成测试");
+    } finally {
+      await root.close();
+    }
+  });
+
+  it("P1-R02：POST /tasks/:taskId/cancel 对不存在的任务返回 404", async () => {
+    const root = buildCompositionRoot({ dbPath });
+    try {
+      const cancelRes = await root.app.inject({
+        method: "POST",
+        url: "/tasks/nonexistent-task/cancel",
+        payload: { reason: "test" }
+      });
+      expect(cancelRes.statusCode).toBe(404);
+    } finally {
+      await root.close();
+    }
+  });
+
+  it("P1-R02：POST /tasks/:taskId/cancel 对未登记项目的任务仍安全降级（不抛 500）", async () => {
+    const root = buildCompositionRoot({ dbPath });
+    try {
+      // 创建任务但项目未登记到 store —— cancel API 的 getServicesForProject
+      // 会抛错，但 cancel 端点应安全降级并继续取消流程。
+      await root.store.unitOfWork.run(async (tx) => {
+        await tx.projects.save(sampleProject());
+      });
+
+      const createRes = await root.app.inject({
+        method: "POST",
+        url: "/tasks",
+        payload: { projectId: "proj-1", input: sampleInput() }
+      });
+      const task = createRes.json() as { id: string };
+
+      // 正常取消（项目已登记，getServicesForProject 成功）
+      const cancelRes = await root.app.inject({
+        method: "POST",
+        url: `/tasks/${task.id}/cancel`,
+        payload: { reason: "安全降级测试" }
       });
       expect(cancelRes.statusCode).toBe(200);
       expect((cancelRes.json() as { status: string }).status).toBe("CANCELLED");

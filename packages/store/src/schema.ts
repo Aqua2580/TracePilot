@@ -239,3 +239,28 @@ export const schemaMigrations = sqliteTable("schema_migrations", {
   version: integer("version").primaryKey(),
   appliedAt: text("applied_at").notNull()
 });
+
+// ---------------------------------------------------------------------------
+// execution_results —— P1-03：持久化 runDevelop 的 Diff 与验证产物。
+//
+// runDevelop 完成后把 Diff 哈希、patch、changedFiles、验证退出码、
+// 验证 stdout/stderr 持久化到此表。runReview 从此表读取受控来源的
+// 验证产物，不接受调用方提交的 Diff 或验证结果。
+// ---------------------------------------------------------------------------
+
+export const executionResults = sqliteTable("execution_results", {
+  id: text("id").primaryKey(),
+  taskId: text("task_id")
+    .notNull()
+    .references(() => tasks.id, { onDelete: "cascade" }),
+  runId: text("run_id").notNull(),
+  diffHash: text("diff_hash").notNull(),
+  diffPatch: text("diff_patch").notNull(),
+  diffChangedFilesJson: text("diff_changed_files_json").notNull(),
+  diffBytes: integer("diff_bytes").notNull(),
+  verificationExitCode: integer("verification_exit_code").notNull(),
+  verificationPassed: integer("verification_passed", { mode: "boolean" }).notNull(),
+  verificationStdout: text("verification_stdout").notNull(),
+  verificationStderr: text("verification_stderr").notNull(),
+  createdAt: text("created_at").notNull()
+});

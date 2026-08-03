@@ -24,6 +24,7 @@ import { EvidencePackVersionError } from "../domain/evidence.js";
 import type { RepairRecord } from "../domain/repair-record.js";
 import type { AuditEvent } from "../domain/audit.js";
 import type { AgentRunRecord } from "../domain/agent-run.js";
+import type { ExecutionResult } from "../domain/execution-result.js";
 import type { Worktree } from "../ports/adapters.js";
 import type {
   ProjectRepository,
@@ -36,6 +37,7 @@ import type {
   RepairRecordRepository,
   AuditRepository,
   AgentRunRepository,
+  ExecutionResultRepository,
   UnitOfWork,
   TransactionalRepos
 } from "../ports/repositories.js";
@@ -353,6 +355,32 @@ export class InMemoryAgentRunRepository implements AgentRunRepository {
   }
 }
 
+/**
+ * 内存版 ExecutionResultRepository —— P1-03（Phase 4 验收）。
+ *
+ * 持久化 runDevelop 的受控 Diff 与验证产物，供 runReview 受控读取。
+ * 不接受调用方提交的 Diff 或验证结果。
+ */
+export class InMemoryExecutionResultRepository implements ExecutionResultRepository {
+  constructor(private readonly table: AppendOnlySnapshotTable<ExecutionResult>) {}
+  async save(result: ExecutionResult): Promise<void> {
+    this.table.append(result);
+  }
+  async findLatestByTask(taskId: string): Promise<ExecutionResult | undefined> {
+    const results = this.table.all().filter((r) => r.taskId === taskId);
+    if (results.length === 0) return undefined;
+    // 按 createdAt 降序取最新
+    return results.reduce((latest, current) =>
+      current.createdAt > latest.createdAt ? current : latest
+    );
+  }
+  async findByTask(taskId: string): Promise<ExecutionResult[]> {
+    return this.table.all()
+      .filter((r) => r.taskId === taskId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // UnitOfWork：串行队列 + 快照回滚
 // ---------------------------------------------------------------------------
@@ -435,11 +463,12 @@ export function createInMemoryStore(): InMemoryStore {
   const repairRecordsTable = new SnapshotTable<RepairRecord>();
   const auditTable = new AppendOnlySnapshotTable<AuditEvent>();
   const agentRunsTable = new AppendOnlySnapshotTable<AgentRunRecord>();
+  const executionResultsTable = new AppendOnlySnapshotTable<ExecutionResult>();
 
   const allTables: SnapshotCapable[] = [
     projectsTable, tasksTable, evidencePacksTable, evidenceRequestsTable,
     plansTable, approvalsTable, worktreesTable, repairRecordsTable, auditTable,
-    agentRunsTable
+    agentRunsTable, executionResultsTable
   ];
 
   const repos: TransactionalRepos = {
@@ -452,7 +481,8 @@ export function createInMemoryStore(): InMemoryStore {
     worktrees: new InMemoryWorktreeRepository(worktreesTable),
     repairRecords: new InMemoryRepairRecordRepository(repairRecordsTable),
     audit: new InMemoryAuditRepository(auditTable),
-    agentRuns: new InMemoryAgentRunRepository(agentRunsTable)
+    agentRuns: new InMemoryAgentRunRepository(agentRunsTable),
+    executionResults: new InMemoryExecutionResultRepository(executionResultsTable)
   };
 
   const tables: InMemoryTables = {
