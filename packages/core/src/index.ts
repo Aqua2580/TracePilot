@@ -10,6 +10,7 @@ export * from "./domain/project.js";
 export * from "./domain/task.js";
 export * from "./domain/evidence.js";
 export * from "./domain/repair-record.js";
+export * from "./domain/review.js";
 export * from "./domain/audit.js";
 export * from "./domain/agent-run.js";
 export * from "./domain/execution-result.js";
@@ -20,6 +21,7 @@ export * from "./ports/repositories.js";
 export * from "./ports/policies.js";
 export * from "./ports/worktree-filesystem-guard.js";
 export * from "./ports/controlled-file-writer.js";
+export * from "./ports/human-decision-finalization.js";
 
 // 内存仓储（Phase 1 单元测试兜底实现）
 export * from "./repositories/in-memory.js";

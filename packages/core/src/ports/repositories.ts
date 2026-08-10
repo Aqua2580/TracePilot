@@ -61,6 +61,8 @@ export interface PlanRepository {
 
 export interface ApprovalRepository {
   save(approval: ApprovalRecord): Promise<void>;
+  /** 仅供审批提交竞态的失败补偿删除尚未生效的人工决定。 */
+  delete(id: string): Promise<void>;
   findByTask(taskId: string): Promise<ApprovalRecord[]>;
   /** 任务的最新执行审批（若存在；可能已被失效）。 */
   findLatestExecutionApproval(taskId: string): Promise<ApprovalRecord | undefined>;

@@ -13,7 +13,7 @@
  * - foreign_keys=ON 在初始化时通过 PRAGMA 设置（见 sqlite-runtime.ts）。
  */
 
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
 
 // ---------------------------------------------------------------------------
 // projects
@@ -166,11 +166,15 @@ export const repairRecords = sqliteTable("repair_records", {
   }).notNull(),
   symptom: text("symptom").notNull(),
   rootCause: text("root_cause").notNull(),
+  rootCauseConfidence: real("root_cause_confidence"),
+  rootCauseEvidenceIdsJson: text("root_cause_evidence_ids_json").notNull(),
   fixSummary: text("fix_summary").notNull(),
   applicabilityConditionsJson: text("applicability_conditions_json").notNull(),
+  applicabilityEvidenceJson: text("applicability_evidence_json").notNull(),
   failureReasonsJson: text("failure_reasons_json").notNull(),
   inputEvidencePackId: text("input_evidence_pack_id").notNull(),
   inputEvidencePackVersion: integer("input_evidence_pack_version").notNull(),
+  inputEvidencePackContentHash: text("input_evidence_pack_content_hash"),
   diffHash: text("diff_hash"),
   verificationResultJson: text("verification_result_json"),
   reviewResultJson: text("review_result_json"),

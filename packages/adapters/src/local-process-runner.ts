@@ -26,7 +26,8 @@ import type {
   CommandSpec,
   ProcessRunner,
   ProcessPolicy,
-  CommandResult
+  CommandResult,
+  ProcessTerminationResult
 } from "@tracepilot/core";
 
 export class LocalProcessRunner implements ProcessRunner {
@@ -115,11 +116,18 @@ export class LocalProcessRunner implements ProcessRunner {
       }
     });
 
+    let terminationPromise: Promise<ProcessTerminationResult> | undefined;
+    function requestTermination(): void {
+      if (!terminationPromise) {
+        terminationPromise = killProcessTree(child);
+      }
+    }
+
     // 4. 硬超时。超时后用平台专用的进程树终止策略杀死子进程（P2-03）。
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      killProcessTree(child);
+      requestTermination();
     }, spec.timeoutMs);
 
     // P1-05：取消信号。当 abortSignal 被 abort 时，终止整个进程树。
@@ -128,7 +136,7 @@ export class LocalProcessRunner implements ProcessRunner {
     let aborted = false;
     const onAbort = (): void => {
       aborted = true;
-      killProcessTree(child);
+      requestTermination();
     };
     if (abortSignal) {
       if (abortSignal.aborted) {
@@ -152,6 +160,10 @@ export class LocalProcessRunner implements ProcessRunner {
       });
     });
 
+    // 终止命令自身也必须结束后才返回，避免调用方在 taskkill 仍未完成时
+    // 把取消请求误认为已经完成。
+    const termination = terminationPromise ? await terminationPromise : undefined;
+
     const endedAt = new Date().toISOString();
     const originalBytes = stdoutOriginalBytes + stderrOriginalBytes;
     const retainedBytes = stdout.length + stderr.length;
@@ -165,6 +177,7 @@ export class LocalProcessRunner implements ProcessRunner {
       originalBytes,
       retainedBytes,
       timedOut,
+      ...(termination ? { termination } : {}),
       startedAt,
       endedAt
     };
@@ -178,27 +191,92 @@ export class LocalProcessRunner implements ProcessRunner {
  * 孙进程会存活。改用 `taskkill /T /F /PID` 终止整棵树。非 Windows 仍用
  * 进程组信号（spawn 时已 detached 不适用，这里通过 taskkill 兜底）。
  */
-function killProcessTree(child: ChildProcess): void {
-  if (!child.pid) return;
+async function killProcessTree(child: ChildProcess): Promise<ProcessTerminationResult> {
+  if (!child.pid) {
+    return { requested: false, method: "child", completed: false, failure: "spawn_error" };
+  }
+  if (os.platform() === "win32") {
+    // /T 终止指定进程及其子进程；/F 强制。等待 taskkill 的 close/error，
+    // 并在失败时记录固定类别后尝试直接终止主进程，避免取消请求悬挂。
+    const taskkillResult = await runTaskkill(child.pid);
+    if (taskkillResult.completed) return taskkillResult;
+    let fallbackAttempted = false;
+    try {
+      fallbackAttempted = child.kill("SIGKILL");
+    } catch {
+      fallbackAttempted = false;
+    }
+    return { ...taskkillResult, fallbackAttempted };
+  }
+
+  // POSIX：优先终止进程组；失败时兜底终止主进程，并把结果返回给调用方。
   try {
-    if (os.platform() === "win32") {
-      // /T 终止指定进程及其子进程；/F 强制。
-      spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
+    process.kill(-child.pid, "SIGKILL");
+    return { requested: true, method: "process_group", completed: true };
+  } catch {
+    try {
+      const completed = child.kill("SIGKILL");
+      return {
+        requested: true,
+        method: "child",
+        completed,
+        ...(completed ? {} : { failure: "spawn_error" as const })
+      };
+    } catch {
+      return { requested: true, method: "child", completed: false, failure: "spawn_error" };
+    }
+  }
+}
+
+const TASKKILL_TIMEOUT_MS = 5000;
+
+function runTaskkill(pid: number): Promise<ProcessTerminationResult> {
+  return new Promise((resolveP) => {
+    let settled = false;
+    const timerState: { handle?: NodeJS.Timeout } = {};
+    const finish = (result: ProcessTerminationResult): void => {
+      if (settled) return;
+      settled = true;
+      if (timerState.handle) clearTimeout(timerState.handle);
+      resolveP(result);
+    };
+
+    let killer: ChildProcess;
+    try {
+      killer = spawn("taskkill", ["/T", "/F", "/PID", String(pid)], {
         stdio: "ignore",
         shell: false
       });
-    } else {
-      // POSIX：先 SIGTERM，再兜底 SIGKILL。LocalProcessRunner 的超时是
-      // 硬终止场景，这里直接用 SIGKILL 确保结束。
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
+    } catch {
+      finish({ requested: true, method: "taskkill", completed: false, failure: "spawn_error" });
+      return;
     }
-  } catch {
-    // 进程可能已退出；忽略 kill 错误。
-  }
+
+    killer.once("error", () => {
+      finish({ requested: true, method: "taskkill", completed: false, failure: "spawn_error" });
+    });
+    killer.once("close", (code) => {
+      if (code === 0) {
+        finish({ requested: true, method: "taskkill", completed: true, exitCode: 0 });
+      } else {
+        finish({
+          requested: true,
+          method: "taskkill",
+          completed: false,
+          ...(code !== null ? { exitCode: code } : {}),
+          failure: "nonzero_exit"
+        });
+      }
+    });
+    timerState.handle = setTimeout(() => {
+      try {
+        killer.kill("SIGKILL");
+      } catch {
+        // taskkill 自身可能已退出；固定记录 timeout 即可。
+      }
+      finish({ requested: true, method: "taskkill", completed: false, failure: "timeout" });
+    }, TASKKILL_TIMEOUT_MS);
+  });
 }
 
 function isInside(candidate: string, root: string): boolean {

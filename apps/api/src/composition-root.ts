@@ -43,7 +43,9 @@ import {
   type PlanNode,
   type RuntimeAdapter,
   type ProcessRunner,
-  type UnitOfWork
+  type UnitOfWork,
+  type HumanDecisionFinalizationGuard,
+  type HumanDecisionFinalizationInput
 } from "@tracepilot/core";
 import { defaultGovernancePolicies } from "@tracepilot/governance";
 import {
@@ -118,6 +120,15 @@ export interface CompositionRootOptions {
    * abort 检查命中并回滚事务，拒绝持久化 executionResults。
    */
   readonly unitOfWorkInterceptor?: (uow: UnitOfWork) => UnitOfWork;
+  /** 服务端可信人工身份；不接受 HTTP 请求体声明。 */
+  readonly humanApprovalIdentity?: string;
+  /** 仅供人类 UI/CLI 通道的审批共享凭证，不注入任何 Runtime 进程。 */
+  readonly humanApprovalChannelSecret?: string;
+  /** 仅用于审批 TOCTOU 屏障测试；生产环境必须留空。 */
+  readonly approvalFinalizationHook?: (input: {
+    readonly taskId: string;
+    readonly diffHash: string;
+  }) => Promise<void>;
 }
 
 export interface CompositionRoot {
@@ -183,7 +194,24 @@ export function buildCompositionRoot(
     process.env.TRACEPILOT_DB_PATH ??
     resolveDefaultDataPath();
   const store = createSqliteStore({ dbPath });
-  const orchestrator = new TaskOrchestrator({ unitOfWork: store.unitOfWork });
+  const humanDecisionFinalizationGuard: HumanDecisionFinalizationGuard = {
+    async finalize<T>(input: HumanDecisionFinalizationInput<T>): Promise<T> {
+      const task = await store.unitOfWork.run((tx) => tx.tasks.findById(input.taskId));
+      if (!task) throw new Error(`任务不存在：${input.taskId}`);
+      const services = await getServicesForProject(task.projectId);
+      return services.executionOrchestrator.finalize(input);
+    }
+  };
+  const orchestrator = new TaskOrchestrator({
+    unitOfWork: store.unitOfWork,
+    humanApproval: {
+      identity: options.humanApprovalIdentity ?? process.env.TRACEPILOT_HUMAN_APPROVER,
+      channelSecret:
+        options.humanApprovalChannelSecret ?? process.env.TRACEPILOT_HUMAN_APPROVAL_SECRET,
+      challengeTtlMs: 5 * 60 * 1000
+    },
+    humanDecisionFinalizationGuard
+  });
   const policies = defaultGovernancePolicies();
   const router = new EvidenceRouter();
 
@@ -432,7 +460,8 @@ export function buildCompositionRoot(
       eventSink: sharedEventSink,
       processRunner: sharedProcessRunner,
       processPolicy: verificationProcessPolicy,
-      filesystemGuard: new LocalWorktreeFilesystemGuard()
+      filesystemGuard: new LocalWorktreeFilesystemGuard(),
+      approvalFinalizationHook: options.approvalFinalizationHook
     });
     return { gitAdapter, worktreeManager, evidenceCollector, executionOrchestrator };
   };
@@ -501,6 +530,20 @@ export function buildCompositionRoot(
   }>("/tasks/:taskId/transition", async (req, reply) => {
     const { to, reason } = req.body ?? ({} as { to: TaskStatus; reason?: string });
     if (!to) return reply.code(400).send({ error: "to 为必填" });
+    const publicTransitionTargets = new Set<TaskStatus>([
+      "INTAKING",
+      "GATHERING_EVIDENCE",
+      "PLANNED",
+      "AWAITING_EXECUTION_APPROVAL",
+      "EVIDENCE_GAP",
+      "VALIDATING",
+      "REVIEWING"
+    ]);
+    if (!publicTransitionTargets.has(to)) {
+      return reply.code(403).send({
+        error: `公开 transition 端点禁止进入安全敏感状态 ${to}`
+      });
+    }
     try {
       const updated = await orchestrator.transitionTask(
         req.params.taskId,
@@ -1045,7 +1088,20 @@ export function buildCompositionRoot(
       //         详见 ExecutionOrchestrator.runReview 的安全约束。
       try {
         const result = await exec.runReview(task.id);
-        return reply.code(200).send(result);
+        // Phase 5：Review 完成后必须立即经过确定性质量门，不能只把
+        // Runtime 返回的 verdict 原样交给调用方。质量门通过才进入
+        // AWAITING_HUMAN_APPROVAL；阻断结果会把任务收口为 FAILED。
+        const gated = await orchestrator.recordReviewAndGate({
+          taskId: task.id,
+          review: result
+        });
+        const response = {
+          ...result,
+          qualityGate: gated.qualityGate,
+          repairRecord: gated.repairRecord,
+          task: gated.task
+        };
+        return reply.code(gated.qualityGate.passed ? 200 : 422).send(response);
       } catch (err) {
         // P1-03：DiffTamperError 是受控错误（非 Runtime 失败），不迁移状态
         const isDiffTamper = (err as Error).name === "DiffTamperError";
@@ -1058,6 +1114,154 @@ export function buildCompositionRoot(
       const message = (err as Error).message;
       return reply.code(400).send({ error: message });
     }
+  });
+
+  // Phase 5：签发一次性人工审批挑战。
+  // 可信身份和通道凭证来自服务端装配，不从请求体读取 approver。
+  app.post<{
+    Params: { taskId: string };
+    Body: { decision: "approved" | "rejected" };
+  }>("/tasks/:taskId/human-approval/challenge", async (req, reply) => {
+    try {
+      const channelSecretHeader = req.headers["x-tracepilot-human-channel-secret"];
+      const channelSecret = Array.isArray(channelSecretHeader)
+        ? channelSecretHeader[0]
+        : channelSecretHeader;
+      if (!channelSecret) {
+        return reply.code(401).send({ error: "缺少人工审批通道凭证" });
+      }
+      const rawBody = (req.body ?? {}) as unknown as Record<string, unknown>;
+      if ("approver" in rawBody || "channelSecret" in rawBody) {
+        return reply.code(400).send({ error: "approver 和 channelSecret 不得由调用方提交" });
+      }
+      if (req.body?.decision !== "approved" && req.body?.decision !== "rejected") {
+        return reply.code(400).send({ error: "decision 必须是 approved 或 rejected" });
+      }
+
+      const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+      if (!task) return reply.code(404).send({ error: "任务不存在" });
+      const services = await getServicesForProject(task.projectId);
+      await services.executionOrchestrator.assertReviewDiffStillCurrent(task.id);
+      const challenge = await orchestrator.issueHumanApprovalChallenge({
+        taskId: task.id,
+        decision: req.body.decision,
+        channelSecret
+      });
+      return reply.code(201).send(challenge);
+    } catch (err) {
+      const name = (err as Error).name;
+      const message = (err as Error).message;
+      if (name === "TaskNotFoundError") return reply.code(404).send({ error: message });
+      if (name === "HumanApprovalCredentialError") return reply.code(401).send({ error: message });
+      if (name === "HumanApprovalConfigurationError") return reply.code(503).send({ error: message });
+      if (name === "InvalidApprovalStateError" || name === "ReviewNotReadyError" || name === "TaskNotInExpectedStatusError" || name === "DiffTamperError") {
+        return reply.code(409).send({ error: message });
+      }
+      return reply.code(400).send({ error: message });
+    }
+  });
+
+  // Phase 5：消费一次性挑战，完成最终批准 / 拒绝。
+  // 请求体只允许 challengeToken 和 reason；approver/decision 由服务端挑战绑定。
+  app.post<{
+    Params: { taskId: string };
+    Body: {
+      challengeToken: string;
+      reason?: string;
+    };
+  }>("/tasks/:taskId/human-approval", async (req, reply) => {
+    try {
+      const body = req.body ?? ({} as { challengeToken: string; reason?: string });
+      const rawBody = body as unknown as Record<string, unknown>;
+      if ("approver" in rawBody || "decision" in rawBody) {
+        return reply.code(400).send({ error: "approver 和 decision 不得由调用方提交，请先申请并消费人工审批挑战" });
+      }
+      if (typeof body.challengeToken !== "string" || body.challengeToken.length === 0) {
+        return reply.code(400).send({ error: "challengeToken 为必填" });
+      }
+      const channelSecretHeader = req.headers["x-tracepilot-human-channel-secret"];
+      const channelSecret = Array.isArray(channelSecretHeader)
+        ? channelSecretHeader[0]
+        : channelSecretHeader;
+      if (!channelSecret) return reply.code(401).send({ error: "缺少人工审批通道凭证" });
+
+      const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+      if (!task) return reply.code(404).send({ error: "任务不存在" });
+      const result = await orchestrator.recordHumanDecision({
+        taskId: req.params.taskId,
+        challengeToken: body.challengeToken,
+        channelSecret,
+        reason: body.reason
+      });
+      return reply.code(200).send(result);
+    } catch (err) {
+      const name = (err as Error).name;
+      const message = (err as Error).message;
+      if (name === "TaskNotFoundError") {
+        return reply.code(404).send({ error: message });
+      }
+      if (name === "HumanApprovalCredentialError") {
+        return reply.code(401).send({ error: message });
+      }
+      if (name === "HumanApprovalConfigurationError") {
+        return reply.code(503).send({ error: message });
+      }
+      if (name === "InvalidApprovalStateError" || name === "ReviewNotReadyError" || name === "HumanApprovalChallengeError" || name === "TaskNotInExpectedStatusError" || name === "DiffTamperError" || name === "HumanDecisionFinalizationError") {
+        return reply.code(409).send({ error: message });
+      }
+      return reply.code(400).send({ error: message });
+    }
+  });
+
+  // Phase 5：查询某个任务产生的 Repair Record，包括 DRAFT / VERIFIED /
+  // APPROVED / DEPRECATED 全部生命周期记录，供审计和人工查看。
+  app.get<{ Params: { taskId: string } }>(
+    "/tasks/:taskId/repair-records",
+    async (req, reply) => {
+      const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+      if (!task) return reply.code(404).send({ error: "任务不存在" });
+      const records = await store.unitOfWork.run((tx) => tx.repairRecords.findByTask(task.id));
+      return { records };
+    }
+  );
+
+  // Phase 5：项目级 Repair Memory 召回。默认只返回 APPROVED 记录，并在
+  // 响应中保留 recordId、taskId、Evidence Pack 和 Diff 哈希作为来源链。
+  app.get<{
+    Params: { projectId: string };
+    Querystring: { symptom?: string; rootCause?: string; maxResults?: string };
+  }>("/projects/:projectId/repair-memory", async (req, reply) => {
+    const project = await store.unitOfWork.run((tx) => tx.projects.findById(req.params.projectId));
+    if (!project) return reply.code(404).send({ error: "项目未登记" });
+
+    const parsedMax = req.query.maxResults === undefined ? undefined : Number(req.query.maxResults);
+    if (parsedMax !== undefined && (!Number.isInteger(parsedMax) || parsedMax < 1 || parsedMax > 100)) {
+      return reply.code(400).send({ error: "maxResults 必须是 1 到 100 的整数" });
+    }
+
+    const records = await store.knowledgeAdapter.search({
+      projectId: project.id,
+      symptom: req.query.symptom,
+      rootCause: req.query.rootCause,
+      maxResults: parsedMax
+    });
+    return {
+      source: "sqlite-memory",
+      records: records.map((record) => ({
+        ...record,
+        sourceLocator: {
+          adapter: "sqlite-memory",
+          recordId: record.id,
+          taskId: record.taskId,
+          evidencePackId: record.inputEvidencePackId,
+          evidencePackVersion: record.inputEvidencePackVersion,
+          evidencePackContentHash: record.inputEvidencePackContentHash,
+          evidenceIds: record.rootCauseEvidenceIds,
+          applicabilityEvidence: record.applicabilityConditionEvidence,
+          diffHash: record.diffHash
+        }
+      }))
+    };
   });
 
   // policies 与 runtime 仅供测试 / 后续装配引用，不直接暴露 API。

@@ -401,7 +401,7 @@ describe("ExecutionOrchestrator P1-03 对抗性测试", () => {
 
   describe("runReview 哈希一致时正常通过", () => {
     it("runReview 在工作树 Diff 哈希与持久化哈希一致时正常返回 ReviewResult", async () => {
-      const { orchestrator, exec, fakeGit, fakeProcess } = fixture;
+      const { orchestrator, exec, fakeGit, fakeProcess, fakeRuntime } = fixture;
 
       const task = await orchestrator.createTask({
         projectId: "proj-adv",
@@ -433,6 +433,11 @@ describe("ExecutionOrchestrator P1-03 对抗性测试", () => {
       // 不修改 diff，哈希一致，runReview 应正常通过
       const result = await exec.runReview(task.id);
       expect(result.verdict).toBe("ship");
+      expect(fakeRuntime.lastReviewInput?.evidencePack.id).toBe(`pack-${task.id}`);
+      expect(fakeRuntime.lastReviewInput?.evidencePack.version).toBe(1);
+      expect(fakeRuntime.lastReviewInput?.evidencePack.taskSnapshot.objective).toBe(
+        "修复 createUser 返回错误状态码"
+      );
     });
   });
 

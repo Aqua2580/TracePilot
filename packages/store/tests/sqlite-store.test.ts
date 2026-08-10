@@ -25,13 +25,16 @@ import {
   openDatabase,
   closeDatabase,
   backupDatabase,
+  runMigrations,
   getAppliedVersions,
   getLatestMigrationVersion,
   type SqliteStore
 } from "../src/index.js";
 import {
   TaskOrchestrator,
+  computePackContentHash,
   createInMemoryStore,
+  type EvidenceConstraint,
   type TaskInput,
   type Project
 } from "@tracepilot/core";
@@ -102,6 +105,74 @@ function sampleTaskInput(overrides: Partial<TaskInput> = {}): TaskInput {
   };
 }
 
+async function seedTrustedRepairSources(
+  store: SqliteStore,
+  args: {
+    readonly taskId: string;
+    readonly packId: string;
+    readonly rootCause: string;
+    readonly rootCauseConfidence: number;
+    readonly rootCauseEvidenceIds: readonly string[];
+    readonly constraints: readonly EvidenceConstraint[];
+    readonly diffHash: string;
+    readonly taskInput?: TaskInput;
+  }
+): Promise<string> {
+  const taskSnapshot = args.taskInput ?? sampleTaskInput();
+  const evidenceIds = new Set([
+    ...args.rootCauseEvidenceIds,
+    ...args.constraints.flatMap((condition) => condition.evidenceIds)
+  ]);
+  const evidence = [...evidenceIds].map((id) => ({
+    id,
+    kind: "code" as const,
+    source: "test-fixture",
+    locator: `fixture:${id}`,
+    capturedAt: "2026-01-01T00:00:00.000Z",
+    contentHash: `sha256-${id}`,
+    summary: `测试证据 ${id}`,
+    relevance: 1,
+    trustLevel: "PRIMARY" as const
+  }));
+  const packWithoutHash = {
+    id: args.packId,
+    taskId: args.taskId,
+    version: 1,
+    taskSnapshot,
+    evidence,
+    hypotheses: [
+      {
+        text: args.rootCause,
+        confidence: args.rootCauseConfidence,
+        evidenceIds: args.rootCauseEvidenceIds
+      }
+    ],
+    constraints: args.constraints,
+    acceptanceCriteria: taskSnapshot.acceptanceCriteria,
+    createdAt: "2026-01-01T00:00:00.000Z"
+  };
+  const contentHash = computePackContentHash(packWithoutHash);
+
+  await store.unitOfWork.run(async (tx) => {
+    await tx.evidencePacks.save({ ...packWithoutHash, contentHash });
+    await tx.executionResults.save({
+      id: `execution-${args.taskId}-${args.diffHash}`,
+      taskId: args.taskId,
+      runId: `run-${args.taskId}`,
+      diffHash: args.diffHash,
+      diffPatch: "diff --git a/source.ts b/source.ts",
+      diffChangedFiles: ["source.ts"],
+      diffBytes: 42,
+      verificationExitCode: 0,
+      verificationPassed: true,
+      verificationStdout: "测试通过",
+      verificationStderr: "",
+      createdAt: "2026-01-01T00:00:00.000Z"
+    });
+  });
+  return contentHash;
+}
+
 // ---------------------------------------------------------------------------
 // 迁移测试
 // ---------------------------------------------------------------------------
@@ -120,8 +191,8 @@ describe("SQLite 迁移", () => {
   it("首次打开数据库时应用所有迁移，版本号正确", () => {
     const db = openDatabase({ dbPath });
     const versions = getAppliedVersions(db);
-    expect(versions).toEqual([1, 2, 3, 4]);
-    expect(getLatestMigrationVersion()).toBe(4);
+    expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(getLatestMigrationVersion()).toBe(8);
     closeDatabase(db);
   });
 
@@ -131,9 +202,334 @@ describe("SQLite 迁移", () => {
 
     const db2 = openDatabase({ dbPath });
     const versions = getAppliedVersions(db2);
-    expect(versions).toEqual([1, 2, 3, 4]);
+    expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     closeDatabase(db2);
   });
+
+  it("从迁移 5 升级时隔离无来源高可信记录，并允许合法新记录幂等召回", async () => {
+    const legacyDb = openDatabase({ dbPath, skipMigrations: true });
+    runMigrations(legacyDb, { throughVersion: 5 });
+    expect(getAppliedVersions(legacyDb)).toEqual([1, 2, 3, 4, 5]);
+
+    legacyDb
+      .prepare(
+        `INSERT INTO projects
+         (id, name, repository_path, default_branch, language, commands_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        "project-legacy",
+        "历史项目",
+        "D:/legacy-repo",
+        "main",
+        "typescript",
+        JSON.stringify({ test: { argv: ["pnpm", "test"], timeoutMs: 30000 } }),
+        "2026-01-01T00:00:00.000Z"
+      );
+    legacyDb
+      .prepare(
+        `INSERT INTO tasks
+         (id, project_id, status, input_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        "task-legacy",
+        "project-legacy",
+        "COMPLETED",
+        JSON.stringify(sampleTaskInput()),
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z"
+      );
+    const insertLegacy = legacyDb.prepare(
+      `INSERT INTO repair_records
+       (id, project_id, task_id, status, symptom, root_cause, fix_summary,
+        applicability_conditions_json, failure_reasons_json,
+        input_evidence_pack_id, input_evidence_pack_version,
+        input_evidence_pack_content_hash, diff_hash, verification_result_json,
+        review_result_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const [id, status] of [
+      ["legacy-approved", "APPROVED"],
+      ["legacy-verified", "VERIFIED"],
+      ["legacy-draft", "DRAFT"]
+    ] as const) {
+      insertLegacy.run(
+        id,
+        "project-legacy",
+        "task-legacy",
+        status,
+        "历史测试失败",
+        "历史根因",
+        "历史修复",
+        JSON.stringify(["历史条件"]),
+        JSON.stringify([]),
+        "legacy-pack",
+        1,
+        null,
+        null,
+        null,
+        null,
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z"
+      );
+    }
+    closeDatabase(legacyDb);
+
+    let upgraded: SqliteStore | undefined = createSqliteStore({ dbPath });
+    try {
+      expect(getAppliedVersions(upgraded.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      const migrated = upgraded.db
+        .prepare(
+          "SELECT id, status, failure_reasons_json FROM repair_records ORDER BY id"
+        )
+        .all() as Array<{
+          id: string;
+          status: string;
+          failure_reasons_json: string;
+        }>;
+      expect(migrated.map(({ id, status }) => ({ id, status }))).toEqual([
+        { id: "legacy-approved", status: "DEPRECATED" },
+        { id: "legacy-draft", status: "DRAFT" },
+        { id: "legacy-verified", status: "DEPRECATED" }
+      ]);
+      for (const row of migrated.filter((item) => item.status === "DEPRECATED")) {
+        expect(JSON.parse(row.failure_reasons_json)).toContain(
+          "迁移 7 隔离：历史高可信记录无法重新验证完整 Evidence Pack、Diff 与验证来源链"
+        );
+      }
+      await expect(
+        upgraded.knowledgeAdapter.search({ projectId: "project-legacy" })
+      ).resolves.toEqual([]);
+      await expect(
+        upgraded.knowledgeAdapter.search({
+          projectId: "project-legacy",
+          minStatus: "VERIFIED"
+        })
+      ).resolves.toEqual([]);
+
+      const condition = {
+        text: "仅适用于 TypeScript 项目",
+        evidenceIds: ["evidence-new"],
+        required: true
+      } as const;
+      const packContentHash = await seedTrustedRepairSources(upgraded, {
+        taskId: "task-legacy",
+        packId: "pack-new",
+        rootCause: "新根因",
+        rootCauseConfidence: 0.95,
+        rootCauseEvidenceIds: ["evidence-new"],
+        constraints: [condition],
+        diffHash: "sha256-new-diff"
+      });
+      await upgraded.knowledgeAdapter.write({
+        id: "new-approved",
+        projectId: "project-legacy",
+        taskId: "task-legacy",
+        status: "APPROVED",
+        symptom: "新测试失败",
+        rootCause: "新根因",
+        rootCauseConfidence: 0.95,
+        rootCauseEvidenceIds: ["evidence-new"],
+        fixSummary: "新修复",
+        applicabilityConditions: [condition.text],
+        applicabilityConditionEvidence: [condition],
+        failureReasons: [],
+        inputEvidencePackId: "pack-new",
+        inputEvidencePackVersion: 1,
+        inputEvidencePackContentHash: packContentHash,
+        diffHash: "sha256-new-diff",
+        verificationResult: {
+          passed: true,
+          ranCommands: ["pnpm test"],
+          exitCodes: { "pnpm test": 0 }
+        },
+        reviewResult: { verdict: "ship", findings: [] },
+        createdAt: "2026-01-02T00:00:00.000Z",
+        updatedAt: "2026-01-02T00:00:00.000Z"
+      });
+      await expect(
+        upgraded.knowledgeAdapter.search({ projectId: "project-legacy" })
+      ).resolves.toMatchObject([{ id: "new-approved", status: "APPROVED" }]);
+
+      upgraded.close();
+      upgraded = createSqliteStore({ dbPath });
+      expect(getAppliedVersions(upgraded.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      await expect(
+        upgraded.knowledgeAdapter.search({ projectId: "project-legacy" })
+      ).resolves.toMatchObject([{ id: "new-approved", status: "APPROVED" }]);
+    } finally {
+      upgraded?.close();
+    }
+  });
+
+  it("迁移 7/8 保留可重新验证完整来源链的既有 APPROVED 记录", async () => {
+    const versionSixDb = openDatabase({ dbPath, skipMigrations: true });
+    runMigrations(versionSixDb, { throughVersion: 6 });
+    closeDatabase(versionSixDb);
+
+    const versionSixStore = createSqliteStore({ dbPath, skipMigrations: true });
+    await seedProject(versionSixStore);
+    await versionSixStore.unitOfWork.run(async (tx) => {
+      await tx.tasks.save({
+        id: "task-valid-v6",
+        projectId: "proj-1",
+        status: "COMPLETED",
+        input: sampleTaskInput(),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+    });
+    const packContentHash = await seedTrustedRepairSources(versionSixStore, {
+      taskId: "task-valid-v6",
+      packId: "pack-valid-v6",
+      rootCause: "可验证根因",
+      rootCauseConfidence: 0.92,
+      rootCauseEvidenceIds: ["evidence-valid-v6"],
+      constraints: [],
+      diffHash: "sha256-valid-v6"
+    });
+    await versionSixStore.knowledgeAdapter.write({
+      id: "approved-valid-v6",
+      projectId: "proj-1",
+      taskId: "task-valid-v6",
+      status: "APPROVED",
+      symptom: "升级前测试失败",
+      rootCause: "可验证根因",
+      rootCauseConfidence: 0.92,
+      rootCauseEvidenceIds: ["evidence-valid-v6"],
+      fixSummary: "升级前合法修复",
+      applicabilityConditions: [],
+      applicabilityConditionEvidence: [],
+      failureReasons: [],
+      inputEvidencePackId: "pack-valid-v6",
+      inputEvidencePackVersion: 1,
+      inputEvidencePackContentHash: packContentHash,
+      diffHash: "sha256-valid-v6",
+      verificationResult: {
+        passed: true,
+        ranCommands: ["pnpm test"],
+        exitCodes: { "pnpm test": 0 }
+      },
+      reviewResult: { verdict: "ship", findings: [] },
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z"
+    });
+    versionSixStore.close();
+
+    const latestStore = createSqliteStore({ dbPath });
+    try {
+      expect(getAppliedVersions(latestStore.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      const row = latestStore.db
+        .prepare("SELECT status FROM repair_records WHERE id = ?")
+        .get("approved-valid-v6") as { status: string };
+      expect(row.status).toBe("APPROVED");
+      await expect(
+        latestStore.knowledgeAdapter.search({ projectId: "proj-1" })
+      ).resolves.toMatchObject([
+        { id: "approved-valid-v6", status: "APPROVED" }
+      ]);
+    } finally {
+      latestStore.close();
+    }
+  });
+
+  it.each([6, 7] as const)(
+    "从迁移 %s 升级时隔离跨项目高可信行，运行时召回失败关闭且重启幂等",
+    async (sourceVersion) => {
+    const historicalDb = openDatabase({ dbPath, skipMigrations: true });
+    runMigrations(historicalDb, { throughVersion: sourceVersion });
+    closeDatabase(historicalDb);
+
+    const historicalStore = createSqliteStore({ dbPath, skipMigrations: true });
+    await seedProject(historicalStore, sampleProject("project-a"));
+    await seedProject(historicalStore, sampleProject("project-b"));
+    await historicalStore.unitOfWork.run(async (tx) => {
+      await tx.tasks.save({
+        id: "task-project-b",
+        projectId: "project-b",
+        status: "COMPLETED",
+        input: sampleTaskInput(),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+    });
+    const packContentHash = await seedTrustedRepairSources(historicalStore, {
+      taskId: "task-project-b",
+      packId: "pack-project-b",
+      rootCause: "项目 B 根因",
+      rootCauseConfidence: 0.94,
+      rootCauseEvidenceIds: ["evidence-project-b"],
+      constraints: [],
+      diffHash: "sha256-project-b"
+    });
+    await historicalStore.unitOfWork.run(async (tx) => {
+      // 模拟旧版本或内部误用直接写入：record 声明项目 A，来源任务实际属于项目 B。
+      await tx.repairRecords.save({
+        id: "record-cross-project",
+        projectId: "project-a",
+        taskId: "task-project-b",
+        status: "APPROVED",
+        symptom: "跨项目症状",
+        rootCause: "项目 B 根因",
+        rootCauseConfidence: 0.94,
+        rootCauseEvidenceIds: ["evidence-project-b"],
+        fixSummary: "项目 B 修复",
+        applicabilityConditions: [],
+        applicabilityConditionEvidence: [],
+        failureReasons: [],
+        inputEvidencePackId: "pack-project-b",
+        inputEvidencePackVersion: 1,
+        inputEvidencePackContentHash: packContentHash,
+        diffHash: "sha256-project-b",
+        verificationResult: {
+          passed: true,
+          ranCommands: ["pnpm test"],
+          exitCodes: { "pnpm test": 0 }
+        },
+        reviewResult: { verdict: "ship", findings: [] },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+    });
+    await expect(
+      historicalStore.knowledgeAdapter.search({ projectId: "project-a" })
+    ).resolves.toEqual([]);
+    historicalStore.close();
+
+    let latestStore: SqliteStore | undefined = createSqliteStore({ dbPath });
+    try {
+      expect(getAppliedVersions(latestStore.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      const migrated = latestStore.db
+        .prepare(
+          "SELECT status, failure_reasons_json FROM repair_records WHERE id = ?"
+        )
+        .get("record-cross-project") as {
+          status: string;
+          failure_reasons_json: string;
+        };
+      expect(migrated.status).toBe("DEPRECATED");
+      expect(JSON.parse(migrated.failure_reasons_json)).toContain(
+        sourceVersion === 6
+          ? "迁移 7 隔离：历史高可信记录无法重新验证完整 Evidence Pack、Diff 与验证来源链"
+          : "迁移 8 隔离：高可信记录的 Task 项目归属或完整来源链无法重新验证"
+      );
+      await expect(
+        latestStore.knowledgeAdapter.search({ projectId: "project-a" })
+      ).resolves.toEqual([]);
+
+      latestStore.close();
+      latestStore = createSqliteStore({ dbPath });
+      expect(getAppliedVersions(latestStore.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      const restarted = latestStore.db
+        .prepare("SELECT status FROM repair_records WHERE id = ?")
+        .get("record-cross-project") as { status: string };
+      expect(restarted.status).toBe("DEPRECATED");
+    } finally {
+      latestStore?.close();
+    }
+    }
+  );
 
   it("迁移后所有表存在", () => {
     const db = openDatabase({ dbPath });
@@ -505,16 +901,43 @@ describe("SQLite Repair Memory 召回", () => {
       });
     });
 
+    const condition = {
+      text: "python",
+      evidenceIds: ["evidence-1"],
+      required: true
+    } as const;
+    const diffHash = "sha256-repair-memory";
+    const packContentHash = await seedTrustedRepairSources(store, {
+      taskId: "task-1",
+      packId: "pack-1",
+      rootCause: "空指针",
+      rootCauseConfidence: 0.9,
+      rootCauseEvidenceIds: ["evidence-1"],
+      constraints: [condition],
+      diffHash
+    });
+
     const baseRecord = {
       projectId: "proj-1",
       taskId: "task-1",
       symptom: "pytest 失败",
       rootCause: "空指针",
+      rootCauseConfidence: 0.9,
+      rootCauseEvidenceIds: ["evidence-1"],
       fixSummary: "增加空检查",
       applicabilityConditions: ["python"],
+      applicabilityConditionEvidence: [condition],
       failureReasons: ["未处理 None"],
       inputEvidencePackId: "pack-1",
       inputEvidencePackVersion: 1,
+      inputEvidencePackContentHash: packContentHash,
+      diffHash,
+      verificationResult: {
+        passed: true,
+        ranCommands: ["pytest"],
+        exitCodes: { pytest: 0 }
+      },
+      reviewResult: { verdict: "ship" as const, findings: [] },
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z"
     };
@@ -542,6 +965,181 @@ describe("SQLite Repair Memory 召回", () => {
     });
     const ids = results.map((r) => r.id).sort();
     expect(ids).toEqual(["r-approved", "r-verified"]);
+  });
+
+  it("手工篡改为无对应 Pack 的 APPROVED 行时召回失败关闭", async () => {
+    await seedRepairRecords();
+    store.db
+      .prepare(
+        `UPDATE repair_records
+         SET input_evidence_pack_id = ?, input_evidence_pack_content_hash = ?
+         WHERE id = ?`
+      )
+      .run("missing-pack", "fnv1a32-spoofed", "r-approved");
+
+    await expect(
+      store.knowledgeAdapter.search({ projectId: "proj-1" })
+    ).resolves.toEqual([]);
+  });
+
+  it("单条高可信行 JSON 损坏时跳过该行且不阻塞其他合法召回", async () => {
+    await seedRepairRecords();
+    store.db
+      .prepare(
+        "UPDATE repair_records SET root_cause_evidence_ids_json = ? WHERE id = ?"
+      )
+      .run("{broken-json", "r-approved");
+
+    await expect(
+      store.knowledgeAdapter.search({
+        projectId: "proj-1",
+        minStatus: "VERIFIED"
+      })
+    ).resolves.toMatchObject([{ id: "r-verified", status: "VERIFIED" }]);
+  });
+
+  it("按症状相关性排序并隔离项目范围", async () => {
+    await seedProject(store);
+    await seedProject(store, sampleProject("proj-2"));
+    await store.unitOfWork.run(async (tx) => {
+      await tx.tasks.save({
+        id: "task-memory-1",
+        projectId: "proj-1",
+        status: "COMPLETED",
+        input: sampleTaskInput(),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+      await tx.tasks.save({
+        id: "task-memory-2",
+        projectId: "proj-2",
+        status: "COMPLETED",
+        input: sampleTaskInput(),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+    });
+
+    const memoryCondition = {
+      text: "仅适用于当前接口",
+      evidenceIds: ["evidence-memory"],
+      required: true
+    } as const;
+    const projectOnePackHash = await seedTrustedRepairSources(store, {
+      taskId: "task-memory-1",
+      packId: "pack-memory-1",
+      rootCause: "空指针",
+      rootCauseConfidence: 0.9,
+      rootCauseEvidenceIds: ["evidence-memory"],
+      constraints: [memoryCondition],
+      diffHash: "sha256-memory-1"
+    });
+    const projectTwoPackHash = await seedTrustedRepairSources(store, {
+      taskId: "task-memory-2",
+      packId: "pack-memory-2",
+      rootCause: "空指针",
+      rootCauseConfidence: 0.9,
+      rootCauseEvidenceIds: ["evidence-memory"],
+      constraints: [memoryCondition],
+      diffHash: "sha256-memory-2"
+    });
+
+    const common = {
+      rootCauseConfidence: 0.9,
+      rootCauseEvidenceIds: ["evidence-memory"],
+      fixSummary: "增加空值检查",
+      applicabilityConditions: ["仅适用于当前接口"],
+      applicabilityConditionEvidence: [memoryCondition],
+      failureReasons: [],
+      inputEvidencePackVersion: 1,
+      verificationResult: {
+        passed: true,
+        ranCommands: ["pytest"],
+        exitCodes: { pytest: 0 }
+      },
+      reviewResult: { verdict: "ship" as const, findings: [] },
+      status: "APPROVED" as const
+    };
+    await store.knowledgeAdapter.write({
+      ...common,
+      id: "memory-exact",
+      projectId: "proj-1",
+      taskId: "task-memory-1",
+      inputEvidencePackId: "pack-memory-1",
+      inputEvidencePackContentHash: projectOnePackHash,
+      diffHash: "sha256-memory-1",
+      symptom: "pytest 失败",
+      rootCause: "空指针",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:01.000Z"
+    });
+    await store.knowledgeAdapter.write({
+      ...common,
+      id: "memory-partial",
+      projectId: "proj-1",
+      taskId: "task-memory-1",
+      inputEvidencePackId: "pack-memory-1",
+      inputEvidencePackContentHash: projectOnePackHash,
+      diffHash: "sha256-memory-1",
+      symptom: "测试失败",
+      rootCause: "空指针",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:02.000Z"
+    });
+    await store.knowledgeAdapter.write({
+      ...common,
+      id: "memory-other-project",
+      projectId: "proj-2",
+      taskId: "task-memory-2",
+      inputEvidencePackId: "pack-memory-2",
+      inputEvidencePackContentHash: projectTwoPackHash,
+      diffHash: "sha256-memory-2",
+      symptom: "pytest 失败",
+      rootCause: "空指针",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:03.000Z"
+    });
+
+    const results = await store.knowledgeAdapter.search({
+      projectId: "proj-1",
+      symptom: "pytest 失败",
+      maxResults: 2
+    });
+    expect(results.map((r) => r.id)).toEqual(["memory-exact"]);
+    expect(results[0]?.verificationResult?.ranCommands).toEqual(["pytest"]);
+    expect(results[0]?.verificationResult?.exitCodes).toEqual({ pytest: 0 });
+    expect(results[0]?.verificationResult?.exitCodes).not.toBeInstanceOf(Map);
+
+    const rootCauseResults = await store.knowledgeAdapter.search({
+      projectId: "proj-1",
+      rootCause: "空指针"
+    });
+    expect(rootCauseResults.map((r) => r.id).sort()).toEqual([
+      "memory-exact",
+      "memory-partial"
+    ]);
+  });
+
+  it("兼容旧版 Map 退出码 JSON，不因历史记录阻塞读取", async () => {
+    await seedRepairRecords();
+    store.db
+      .prepare("UPDATE repair_records SET verification_result_json = ? WHERE id = ?")
+      .run(
+        JSON.stringify({
+          passed: true,
+          ranCommands: ["pytest"],
+          // 旧实现把 Map 序列化为 {}；读取必须保持可用并显式暴露空映射。
+          exitCodes: {}
+        }),
+        "r-approved"
+      );
+
+    const results = await store.knowledgeAdapter.search({ projectId: "proj-1" });
+    expect(results).toHaveLength(1);
+    expect(results[0]?.verificationResult?.passed).toBe(true);
+    expect(results[0]?.verificationResult?.ranCommands).toEqual(["pytest"]);
+    expect(results[0]?.verificationResult?.exitCodes).toEqual({});
+    expect(results[0]?.verificationResult?.exitCodes).not.toBeInstanceOf(Map);
   });
 });
 

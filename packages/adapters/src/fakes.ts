@@ -8,7 +8,12 @@
  */
 
 import { isAbsolute } from "node:path";
-import { randomId } from "@tracepilot/core";
+import {
+  assertMemoryQuery,
+  assertRepairRecordForKnowledgeWrite,
+  randomId,
+  RepairMemoryWriteError
+} from "@tracepilot/core";
 import type {
   RuntimeAdapter,
   RuntimeTaskInput,
@@ -51,6 +56,8 @@ export interface FakeRuntimeBehaviour {
 export class FakeRuntimeAdapter implements RuntimeAdapter {
   private readonly runs = new Set<string>();
   private readonly cancelled = new Set<string>();
+  /** 测试可读取的最后一次 Review 输入，用于验证 Pack 快照未被丢弃。 */
+  lastReviewInput: ReviewTaskInput | undefined;
   constructor(private readonly behaviour: FakeRuntimeBehaviour = {}) {}
 
   async *analyze(input: RuntimeTaskInput, signal?: AbortSignal): AsyncIterable<RuntimeEvent> {
@@ -154,10 +161,15 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
     if (signal?.aborted) {
       throw new Error("review cancelled (signal aborted)");
     }
+    this.lastReviewInput = input;
     return {
       verdict: this.behaviour.reviewVerdict ?? "ship",
       findings: this.behaviour.reviewFindings ?? [],
-      summary: `FakeRuntimeAdapter review of ${input.diff.changedFiles.length} files`
+      summary: `FakeRuntimeAdapter review of ${input.diff.changedFiles.length} files`,
+      ...(input.evidencePack.hypotheses[0]
+        ? { rootCause: input.evidencePack.hypotheses[0] }
+        : {}),
+      applicabilityConditions: [...input.evidencePack.constraints]
     };
   }
 
@@ -170,10 +182,27 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
 // FakeKnowledgeAdapter — §6（必须与 SqliteRepairMemoryAdapter 通过相同契约）
 // ---------------------------------------------------------------------------
 
+export interface FakeKnowledgeAdapterOptions {
+  /** 可选的外键存在性检查；契约测试用它模拟关系型存储约束。 */
+  readonly referenceExists?: (
+    projectId: string,
+    taskId: string
+  ) => boolean | Promise<boolean>;
+  /** 可选的项目存在性检查；与 taskProjectId 配合模拟项目外键。 */
+  readonly projectExists?: (projectId: string) => boolean | Promise<boolean>;
+  /** 返回任务真实所属项目；undefined 表示任务不存在。 */
+  readonly taskProjectId?: (
+    taskId: string
+  ) => string | undefined | Promise<string | undefined>;
+}
+
 export class FakeKnowledgeAdapter implements KnowledgeAdapter {
   private readonly records = new Map<string, RepairRecord>();
 
+  constructor(private readonly options: FakeKnowledgeAdapterOptions = {}) {}
+
   async search(query: MemoryQuery): Promise<RepairRecord[]> {
+    assertMemoryQuery(query);
     const minStatus = query.minStatus ?? "APPROVED";
     const statusOrder: RepairRecord["status"][] = ["DRAFT", "VERIFIED", "APPROVED", "DEPRECATED"];
     const minIdx = statusOrder.indexOf(minStatus);
@@ -190,22 +219,84 @@ export class FakeKnowledgeAdapter implements KnowledgeAdapter {
       return true;
     });
 
-    // 若提供 symptom / rootCause，则做朴素的文本匹配。
-    if (query.symptom) {
-      const s = query.symptom.toLowerCase();
-      results = results.filter(
-        (r) => r.symptom.toLowerCase().includes(s) || r.rootCause.toLowerCase().includes(s)
-      );
-    }
-    if (query.rootCause) {
-      const s = query.rootCause.toLowerCase();
-      results = results.filter((r) => r.rootCause.toLowerCase().includes(s));
-    }
+    // 召回规则与 SQLite 实现保持一致：项目隔离、文本过滤、确定性
+    // 相关性排序，最后按更新时间和 id 稳定打破平局。
+    const symptom = query.symptom?.trim().toLocaleLowerCase();
+    const rootCause = query.rootCause?.trim().toLocaleLowerCase();
+    results = results.filter((record) => {
+      if (symptom && !record.symptom.toLocaleLowerCase().includes(symptom) && !record.rootCause.toLocaleLowerCase().includes(symptom)) {
+        return false;
+      }
+      if (rootCause && !record.rootCause.toLocaleLowerCase().includes(rootCause)) {
+        return false;
+      }
+      return true;
+    });
+    const score = (record: RepairRecord): number => {
+      const recordSymptom = record.symptom.toLocaleLowerCase();
+      const recordRootCause = record.rootCause.toLocaleLowerCase();
+      let value = 0;
+      if (symptom) {
+        if (recordSymptom === symptom) value += 100;
+        else if (recordSymptom.includes(symptom)) value += 60;
+        if (recordRootCause.includes(symptom)) value += 30;
+      }
+      if (rootCause) {
+        if (recordRootCause === rootCause) value += 100;
+        else if (recordRootCause.includes(rootCause)) value += 60;
+      }
+      return value;
+    };
+    results.sort((left, right) => {
+      const scoreDelta = score(right) - score(left);
+      if (scoreDelta !== 0) return scoreDelta;
+      const timeDelta = right.updatedAt.localeCompare(left.updatedAt);
+      return timeDelta !== 0 ? timeDelta : left.id.localeCompare(right.id);
+    });
 
-    return results.slice(0, query.maxResults ?? 10);
+    const limit = query.maxResults ?? 10;
+    return limit > 0 ? results.slice(0, limit) : [];
   }
 
   async write(record: RepairRecord): Promise<void> {
+    assertRepairRecordForKnowledgeWrite(record);
+    if (this.options.taskProjectId) {
+      const [projectExists, taskProjectId] = await Promise.all([
+        this.options.projectExists?.(record.projectId) ?? true,
+        this.options.taskProjectId(record.taskId)
+      ]);
+      if (!projectExists || taskProjectId === undefined) {
+        throw new RepairMemoryWriteError(
+          "missing_reference",
+          `projectId=${record.projectId} 或 taskId=${record.taskId} 不存在`
+        );
+      }
+      if (taskProjectId !== record.projectId) {
+        throw new RepairMemoryWriteError(
+          "project_mismatch",
+          `taskId=${record.taskId} 实际属于 projectId=${taskProjectId}，不能写入 projectId=${record.projectId}`
+        );
+      }
+    } else if (
+      this.options.referenceExists &&
+      !(await this.options.referenceExists(record.projectId, record.taskId))
+    ) {
+      throw new RepairMemoryWriteError(
+        "missing_reference",
+        `projectId=${record.projectId} 或 taskId=${record.taskId} 不存在`
+      );
+    }
+
+    const existing = this.records.get(record.id);
+    if (
+      existing &&
+      (existing.projectId !== record.projectId || existing.taskId !== record.taskId)
+    ) {
+      throw new RepairMemoryWriteError(
+        "identity_mismatch",
+        `Repair Record ${record.id} 的 projectId/taskId 身份不可变`
+      );
+    }
     this.records.set(record.id, record);
   }
 

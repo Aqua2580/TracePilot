@@ -324,7 +324,7 @@ describe("API 组合根（SQLite 装配）", () => {
     }
   });
 
-  it("非法迁移返回 400 及错误消息", async () => {
+  it("安全敏感迁移返回 403 及错误消息", async () => {
     const root = buildCompositionRoot({ dbPath });
     try {
       await root.store.unitOfWork.run(async (tx) => {
@@ -345,7 +345,7 @@ describe("API 组合根（SQLite 装配）", () => {
         url: `/tasks/${task.id}/transition`,
         payload: { to: "EXECUTING" }
       });
-      expect(transRes.statusCode).toBe(400);
+      expect(transRes.statusCode).toBe(403);
       const body = transRes.json() as { error: string };
       expect(body.error).toMatch(/EXECUTING/);
     } finally {
@@ -353,7 +353,7 @@ describe("API 组合根（SQLite 装配）", () => {
     }
   });
 
-  it("P1-R02：API 不得绕过执行审批，从 AWAITING_EXECUTION_APPROVAL 经 /transition 到 EXECUTING 返回 400", async () => {
+  it("P1-R02：API 不得绕过执行审批，从 AWAITING_EXECUTION_APPROVAL 经 /transition 到 EXECUTING 返回 403", async () => {
     const root = buildCompositionRoot({ dbPath });
     try {
       await root.store.unitOfWork.run(async (tx) => {
@@ -385,7 +385,7 @@ describe("API 组合根（SQLite 装配）", () => {
         url: `/tasks/${task.id}/transition`,
         payload: { to: "EXECUTING" }
       });
-      expect(transRes.statusCode).toBe(400);
+      expect(transRes.statusCode).toBe(403);
       const body = transRes.json() as { error: string; status?: string };
       expect(body.error).toMatch(/EXECUTING/);
 

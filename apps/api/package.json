@@ -11,6 +11,7 @@
     "start": "node dist/server.js",
     "test": "vitest run",
     "test:omp-real": "node -e \"process.env.TRACEPILOT_OMP_REAL_STRICT='1';require('child_process').execSync('vitest run tests/omp-real-closed-loop.test.ts',{stdio:'inherit',env:process.env})\"",
+    "test:phase5-real": "node -e \"process.env.TRACEPILOT_PHASE5_REAL_STRICT='1';require('child_process').execSync('vitest run tests/phase5-real-reviewer.test.ts',{stdio:'inherit',env:process.env})\"",
     "lint": "eslint src tests"
   },
   "dependencies": {

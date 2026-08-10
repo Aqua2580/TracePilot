@@ -19,7 +19,6 @@ import {
   type PlanNode,
   type InMemoryStore
 } from "../src/index.js";
-
 function sampleTaskInput(overrides: Partial<TaskInput> = {}): TaskInput {
   return {
     objective: "修复失败的 pytest 用例 test_users_create",
@@ -157,7 +156,7 @@ describe("TaskOrchestrator", () => {
       EVIDENCE_GAP: ["EXECUTING", "EVIDENCE_GAP"],
       VALIDATING: ["EXECUTING", "VALIDATING"],
       REVIEWING: ["EXECUTING", "VALIDATING", "REVIEWING"],
-      AWAITING_HUMAN_APPROVAL: ["EXECUTING", "VALIDATING", "REVIEWING", "AWAITING_HUMAN_APPROVAL"]
+      AWAITING_HUMAN_APPROVAL: ["EXECUTING", "VALIDATING", "REVIEWING"]
     };
 
     // 1. CREATED → INTAKING → GATHERING_EVIDENCE。
@@ -214,6 +213,19 @@ describe("TaskOrchestrator", () => {
     }
   }
 
+  async function forceAwaitingHumanApproval(taskId: string): Promise<void> {
+    await moveTo(taskId, "REVIEWING");
+    await store.unitOfWork.run(async (tx) => {
+      const current = await tx.tasks.findById(taskId);
+      if (!current) throw new Error("测试任务不存在");
+      await tx.tasks.save({
+        ...current,
+        status: "AWAITING_HUMAN_APPROVAL",
+        updatedAt: new Date().toISOString()
+      });
+    });
+  }
+
   describe("createTask", () => {
     it("创建任务后处于 CREATED，并写入 task_created 审计事件", async () => {
       const task = await orchestrator.createTask({
@@ -240,7 +252,8 @@ describe("TaskOrchestrator", () => {
 
       // P1-R03 / P1-R04：合法时序需要 Plan + execution approval 才能
       // 经 beginExecutionIfApproved 进入 EXECUTING。本测试直接走完整
-      // 合法流程（与 moveTo 等价）以到达 AWAITING_HUMAN_APPROVAL。
+      // 合法通用迁移只允许到 REVIEWING；进入人工审批必须由
+      // recordReviewAndGate 完成，不能由本测试绕过。
       await orchestrator.transitionTask(task.id, "INTAKING");
       await orchestrator.transitionTask(task.id, "GATHERING_EVIDENCE");
       const packId = `pack-${task.id}`;
@@ -270,18 +283,48 @@ describe("TaskOrchestrator", () => {
       await orchestrator.beginExecutionIfApproved(task.id);
       await orchestrator.transitionTask(task.id, "VALIDATING");
       await orchestrator.transitionTask(task.id, "REVIEWING");
-      await orchestrator.transitionTask(task.id, "AWAITING_HUMAN_APPROVAL");
 
       const final = await store.tasks.findById(task.id);
-      expect(final?.status).toBe("AWAITING_HUMAN_APPROVAL");
+      expect(final?.status).toBe("REVIEWING");
 
       // 1 条创建 +
       // 2 条迁移到 GATHERING_EVIDENCE +
       // 1 条 Pack v1 + 1 条迁移到 PLANNED + 1 条 plan_recorded +
       // 1 条迁移到 AWAITING_EXECUTION_APPROVAL + 1 条执行审批 +
-      // 1 条进入 EXECUTING 迁移 + 3 条迁移到 AWAITING_HUMAN_APPROVAL = 12 条
+      // 1 条进入 EXECUTING 迁移 + 2 条迁移到 REVIEWING = 11 条
       const audits = await store.audit.findByTask(task.id);
-      expect(audits).toHaveLength(12);
+      expect(audits).toHaveLength(11);
+    });
+
+    it("通用迁移不能绕过 Review、人工审批和 APPROVED Repair Record", async () => {
+      const task = await orchestrator.createTask({
+        projectId: "proj-1",
+        input: sampleTaskInput()
+      });
+      await moveTo(task.id, "REVIEWING");
+
+      await expect(
+        orchestrator.transitionTask(task.id, "AWAITING_HUMAN_APPROVAL")
+      ).rejects.toThrow("必须使用对应的 Review、审批或终态领域服务");
+
+      await store.unitOfWork.run(async (tx) => {
+        const current = await tx.tasks.findById(task.id);
+        if (!current) throw new Error("测试任务不存在");
+        await tx.tasks.save({ ...current, status: "AWAITING_HUMAN_APPROVAL" });
+      });
+      await expect(
+        orchestrator.transitionTask(task.id, "COMPLETED")
+      ).rejects.toThrow("必须使用对应的 Review、审批或终态领域服务");
+      await expect(
+        orchestrator.transitionTask(task.id, "REJECTED")
+      ).rejects.toThrow("必须使用对应的 Review、审批或终态领域服务");
+
+      const stored = await store.tasks.findById(task.id);
+      const approvals = await store.approvals.findByTask(task.id);
+      const records = await store.repairRecords.findByTask(task.id);
+      expect(stored?.status).toBe("AWAITING_HUMAN_APPROVAL");
+      expect(approvals.filter((approval) => approval.kind === "human")).toHaveLength(0);
+      expect(records).toHaveLength(0);
     });
 
     it("跳过闸门时抛 IllegalTransitionError", async () => {
@@ -327,12 +370,17 @@ describe("TaskOrchestrator", () => {
         projectId: "proj-1",
         input: sampleTaskInput()
       });
-      await moveTo(task.id, "AWAITING_HUMAN_APPROVAL");
-      await orchestrator.completeIfEligible({
-        taskId: task.id,
-        validationPassed: true,
-        hasP0OrP1ReviewFindings: false,
-        hasHumanApproval: true
+      await moveTo(task.id, "REVIEWING");
+      // 该用例只验证终态状态机。Phase 5 的完成闸门由专门测试覆盖，
+      // 这里直接把已完成快照写入测试仓储，避免重新引入已删除的布尔参数。
+      await store.unitOfWork.run(async (tx) => {
+        const current = await tx.tasks.findById(task.id);
+        if (!current) throw new Error("测试任务不存在");
+        await tx.tasks.save({
+          ...current,
+          status: "COMPLETED",
+          updatedAt: new Date().toISOString()
+        });
       });
 
       await expect(
@@ -494,23 +542,23 @@ describe("TaskOrchestrator", () => {
       expect(audits.some((a) => a.type === "execution_approval_granted")).toBe(true);
     });
 
-    it("在 AWAITING_HUMAN_APPROVAL 持久化人类审批拒绝并写审计", async () => {
+    it("在 AWAITING_HUMAN_APPROVAL 拒绝旧的人类审批入口", async () => {
       const task = await orchestrator.createTask({
         projectId: "proj-1",
         input: sampleTaskInput()
       });
-      await moveTo(task.id, "AWAITING_HUMAN_APPROVAL");
-      await orchestrator.recordApproval({
-        taskId: task.id,
-        kind: "human",
-        approver: "bob",
-        decision: "rejected",
-        scopeHash: "scope-x",
-        reason: "修复未触及根因"
-      });
-
-      const audits = await store.audit.findByTask(task.id);
-      expect(audits.some((a) => a.type === "human_approval_rejected")).toBe(true);
+      await forceAwaitingHumanApproval(task.id);
+      await expect(
+        orchestrator.recordApproval({
+          taskId: task.id,
+          kind: "human" as unknown as "execution",
+          approver: "bob",
+          decision: "rejected",
+          scopeHash: "scope-x",
+          reason: "修复未触及根因"
+        })
+      ).rejects.toThrow("不得通过通用 recordApproval");
+      expect((await store.approvals.findByTask(task.id)).filter((a) => a.kind === "human")).toHaveLength(0);
     });
 
     it("P2-05：任务不存在时抛 TaskNotFoundError", async () => {
@@ -832,73 +880,23 @@ describe("TaskOrchestrator", () => {
     });
   });
 
-  describe("completeIfEligible", () => {
-    it("验证通过、评审洁净、人类审批已记录时完成任务", async () => {
-      const task = await orchestrator.createTask({
-        projectId: "proj-1",
-        input: sampleTaskInput()
-      });
-      await moveTo(task.id, "AWAITING_HUMAN_APPROVAL");
-
-      const completed = await orchestrator.completeIfEligible({
+  it("通用审批入口拒绝 human kind，不能绕过 Repair Record 原子迁移", async () => {
+    const task = await orchestrator.createTask({
+      projectId: "proj-1",
+      input: sampleTaskInput()
+    });
+    await forceAwaitingHumanApproval(task.id);
+    await expect(
+      orchestrator.recordApproval({
         taskId: task.id,
-        validationPassed: true,
-        hasP0OrP1ReviewFindings: false,
-        hasHumanApproval: true
-      });
-      expect(completed.status).toBe("COMPLETED");
-    });
-
-    it("验证未通过时拒绝完成", async () => {
-      const task = await orchestrator.createTask({
-        projectId: "proj-1",
-        input: sampleTaskInput()
-      });
-      await moveTo(task.id, "AWAITING_HUMAN_APPROVAL");
-
-      await expect(
-        orchestrator.completeIfEligible({
-          taskId: task.id,
-          validationPassed: false,
-          hasP0OrP1ReviewFindings: false,
-          hasHumanApproval: true
-        })
-      ).rejects.toBeInstanceOf(IllegalTransitionError);
-    });
-
-    it("评审有 P0/P1 时拒绝完成", async () => {
-      const task = await orchestrator.createTask({
-        projectId: "proj-1",
-        input: sampleTaskInput()
-      });
-      await moveTo(task.id, "AWAITING_HUMAN_APPROVAL");
-
-      await expect(
-        orchestrator.completeIfEligible({
-          taskId: task.id,
-          validationPassed: true,
-          hasP0OrP1ReviewFindings: true,
-          hasHumanApproval: true
-        })
-      ).rejects.toBeInstanceOf(IllegalTransitionError);
-    });
-
-    it("缺少人类审批时拒绝完成", async () => {
-      const task = await orchestrator.createTask({
-        projectId: "proj-1",
-        input: sampleTaskInput()
-      });
-      await moveTo(task.id, "AWAITING_HUMAN_APPROVAL");
-
-      await expect(
-        orchestrator.completeIfEligible({
-          taskId: task.id,
-          validationPassed: true,
-          hasP0OrP1ReviewFindings: false,
-          hasHumanApproval: false
-        })
-      ).rejects.toBeInstanceOf(IllegalTransitionError);
-    });
+        kind: "human" as "execution",
+        approver: "伪造身份",
+        decision: "approved",
+        scopeHash: "scope-test"
+      })
+    ).rejects.toThrow("不得通过通用 recordApproval");
+    expect((await store.approvals.findByTask(task.id)).filter((a) => a.kind === "human")).toHaveLength(0);
+    expect((await store.tasks.findById(task.id))?.status).toBe("AWAITING_HUMAN_APPROVAL");
   });
 
   describe("事务不变量（§5.2）", () => {

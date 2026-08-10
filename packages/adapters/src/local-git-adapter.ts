@@ -38,8 +38,14 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync
+} from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomId } from "@tracepilot/core";
 import type {
   GitAdapter,
@@ -247,7 +253,7 @@ export class LocalGitAdapter implements GitAdapter {
       "worktree",
       auditSink
     );
-    const patch = diffResult.stdout;
+    const trackedPatch = diffResult.stdout;
 
     // 2. git diff --name-only HEAD —— 变更文件列表。
     const filesResult = await this.runGoverned(
@@ -256,9 +262,36 @@ export class LocalGitAdapter implements GitAdapter {
       "worktree",
       auditSink
     );
-    const changedFiles = parseGitDiffChangedFiles(filesResult.stdout);
+    const trackedFiles = parseGitDiffChangedFiles(filesResult.stdout);
 
-    // 3. 计算 sha256 哈希。
+    // 3. `git diff HEAD` 不包含未跟踪新文件。若忽略它们，Review/审批的
+    // Diff 哈希在新增文件后仍不变，会形成篡改旁路。使用只读 ls-files
+    // 列出未跟踪文件，再在 Adapter 内按真实路径读取内容并构造确定性 patch。
+    const untrackedResult = await this.runGoverned(
+      ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+      worktreePath,
+      "worktree",
+      auditSink
+    );
+    if (untrackedResult.truncated) {
+      throw new Error("git ls-files 输出被截断，无法完整捕获未跟踪文件，拒绝生成 Diff");
+    }
+    const untrackedFiles = untrackedResult.stdout
+      .split("\0")
+      .filter((path) => path.length > 0)
+      .sort();
+    const untrackedPatches = untrackedFiles.map((path) =>
+      buildUntrackedFilePatch(worktreePath, path, this.opts.processPolicy.maxOutputBytes)
+    );
+    const patch = [trackedPatch, ...untrackedPatches]
+      .filter((part) => part.length > 0)
+      .join(trackedPatch && untrackedPatches.length > 0 ? "\n" : "");
+    if (Buffer.byteLength(patch, "utf8") > this.opts.processPolicy.maxOutputBytes) {
+      throw new Error("完整 Diff 超过输出上限，拒绝截断或批准不完整产物");
+    }
+    const changedFiles = [...new Set([...trackedFiles, ...untrackedFiles])].sort();
+
+    // 4. 计算覆盖已跟踪与未跟踪内容的 sha256 哈希。
     const hash = `sha256-${createHash("sha256").update(patch).digest("hex")}`;
 
     return {
@@ -542,6 +575,69 @@ export class LocalGitAdapter implements GitAdapter {
     };
     auditSink.record(audit);
   }
+}
+
+function buildUntrackedFilePatch(
+  worktreePath: string,
+  relativePath: string,
+  maxBytes: number
+): string {
+  const normalized = relativePath.replace(/\\/g, "/");
+  if (
+    isAbsolute(relativePath) ||
+    normalized.split("/").some((segment) => segment === ".." || segment.length === 0)
+  ) {
+    throw new Error(`git 返回非法未跟踪路径：${relativePath}`);
+  }
+  const worktreeReal = realpathSync(worktreePath);
+  const absolutePath = resolve(worktreeReal, ...normalized.split("/"));
+  const relativeToRoot = relative(worktreeReal, absolutePath);
+  if (
+    relativeToRoot === ".." ||
+    relativeToRoot.startsWith(`..${sep}`) ||
+    isAbsolute(relativeToRoot)
+  ) {
+    throw new Error(`未跟踪文件路径逃逸 worktree：${relativePath}`);
+  }
+  const stat = lstatSync(absolutePath);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`未跟踪路径不是普通文件，拒绝生成 Diff：${relativePath}`);
+  }
+  const realTarget = realpathSync(absolutePath);
+  const realRelative = relative(worktreeReal, realTarget);
+  if (
+    realRelative === ".." ||
+    realRelative.startsWith(`..${sep}`) ||
+    isAbsolute(realRelative)
+  ) {
+    throw new Error(`未跟踪文件真实路径逃逸 worktree：${relativePath}`);
+  }
+  const content = readFileSync(realTarget);
+  if (content.byteLength > maxBytes) {
+    throw new Error(`未跟踪文件超过 Diff 输出上限，拒绝截断：${relativePath}`);
+  }
+  const digest = createHash("sha256").update(content).digest("hex");
+  if (content.includes(0)) {
+    return [
+      `diff --git a/${normalized} b/${normalized}`,
+      "new file mode 100644",
+      `TracePilot-Binary-SHA256: ${digest}`,
+      `TracePilot-Binary-Base64: ${content.toString("base64")}`,
+      ""
+    ].join("\n");
+  }
+  const text = content.toString("utf8");
+  const lines = text.length === 0 ? [] : text.replace(/\n$/, "").split("\n");
+  return [
+    `diff --git a/${normalized} b/${normalized}`,
+    "new file mode 100644",
+    "--- /dev/null",
+    `+++ b/${normalized}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines.map((line) => `+${line}`),
+    `TracePilot-Untracked-SHA256: ${digest}`,
+    ""
+  ].join("\n");
 }
 
 /**

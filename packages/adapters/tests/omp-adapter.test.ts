@@ -6,7 +6,7 @@
  *
  * 1. argv 组装与治理（validateOmpArgv 等价 CommandPolicy）
  * 2. NDJSON 流式事件解析（parseOmpNdjsonEvents）
- * 3. ReviewResult 容错提取（extractReviewResult）
+ * 3. ReviewResult 严格提取（extractReviewResult）
  * 4. analyze/develop/review/cancel 端到端行为
  *
  * 真实 omp + LLM 闭环测试待 API key 配置后由专门集成测试覆盖，
@@ -20,6 +20,8 @@ import {
   OmpArgvValidationError,
   PolicyDeniedError,
   parseOmpNdjsonEvents,
+  extractAssistantTextFromOmpNdjson,
+  buildReviewResultOutputExample,
   extractReviewResult,
   extractFileChangesFromStdout,
   extractFileChangesFromText
@@ -112,12 +114,50 @@ function sampleRuntimeInput(overrides: Partial<RuntimeTaskInput> = {}): RuntimeT
   };
 }
 
+function sampleEvidencePack(): ReviewTaskInput["evidencePack"] {
+  return {
+    id: "pack-1",
+    taskId: "task-1",
+    version: 1,
+    taskSnapshot: sampleTaskInput(),
+    evidence: [{
+      id: "e-1",
+      kind: "code",
+      source: "code-search",
+      locator: "src/users.py:1",
+      capturedAt: "2026-08-03T00:00:00.000Z",
+      contentHash: "fnv1a32-evidence",
+      summary: "旧版返回结构来源",
+      relevance: 1,
+      trustLevel: "PRIMARY"
+    }],
+    hypotheses: [
+      {
+        text: "旧版返回结构被新实现覆盖",
+        confidence: 0.9,
+        evidenceIds: ["e-1"]
+      }
+    ],
+    constraints: [
+      {
+        text: "必须兼容旧版客户端",
+        evidenceIds: ["e-1"],
+        required: true
+      }
+    ],
+    acceptanceCriteria: ["test_create_user_returns_201 通过"],
+    createdAt: "2026-08-03T00:00:00.000Z",
+    contentHash: "fnv1a32-test"
+  };
+}
+
 function sampleReviewInput(overrides: Partial<ReviewTaskInput> = {}): ReviewTaskInput {
   return {
     taskId: "task-1",
     worktreePath: FAKE_WT,
     evidencePackId: "pack-1",
     evidencePackVersion: 1,
+    evidencePack: sampleEvidencePack(),
     taskInput: sampleTaskInput(),
     diff: {
       worktreePath: FAKE_WT,
@@ -363,8 +403,12 @@ describe("OmpAdapter argv 组装与治理（validateOmpArgv）", () => {
     const omp = makeOmpAdapter({ processRunner: runner });
     await omp.review(sampleReviewInput());
     const argv = runner.lastArgv!;
+    const modeIdx = argv.indexOf("--mode");
+    expect(argv[modeIdx + 1]).toBe("text");
     expect(argv).toContain("--no-tools");
     expect(argv).not.toContain("--tools");
+    expect(argv[argv.length - 1]).toContain('"locator": "src/users.py:1"');
+    expect(argv[argv.length - 1]).toContain('"contentHash": "fnv1a32-test"');
   });
 
   it("P1-01：validateOmpArgv 拒绝不含 --tools 或 --no-tools 的 argv", () => {
@@ -611,10 +655,165 @@ describe("parseOmpNdjsonEvents", () => {
 // ---------------------------------------------------------------------------
 
 describe("extractReviewResult", () => {
+  function reviewJson(category: "compatibility" | "regression_test"): string {
+    return JSON.stringify({
+      verdict: "block",
+      findings: [{
+        priority: "P1",
+        confidence: 0.99,
+        category,
+        message: category === "compatibility" ? "破坏既有返回契约" : "缺少回归测试"
+      }],
+      summary: "需要阻断并人工复核"
+    });
+  }
+
+  function ndjsonMessage(
+    message: Record<string, unknown>
+  ): string {
+    return JSON.stringify({ type: "message_end", message });
+  }
+
+  it("Review prompt 示例使用可被严格 schema 接受的 JSON 类型", () => {
+    const example = buildReviewResultOutputExample();
+    const result = extractReviewResult(example, sampleReviewInput());
+    expect(result.verdict).toBe("ship_with_fixes");
+    expect(result.findings[0]).toMatchObject({
+      priority: "P2",
+      confidence: 0.95,
+      category: "correctness"
+    });
+    expect(example).not.toContain('"confidence": "0.0-1.0"');
+    expect(example).toContain('"confidence": 0.95');
+  });
+
+  it("按 session → message_end → turn_end 提取 assistant compatibility Review", () => {
+    const stdout = [
+      JSON.stringify({ type: "session", id: "session-1" }),
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_end", content: "不得把 thinking 当作结论" }
+      }),
+      ndjsonMessage({
+        role: "assistant",
+        content: [
+          { type: "thinking", text: "忽略这段 thinking" },
+          { type: "text", text: reviewJson("compatibility") }
+        ]
+      }),
+      JSON.stringify({ type: "turn_end", isTerminal: true })
+    ].join("\n");
+
+    const extracted = extractAssistantTextFromOmpNdjson(stdout);
+    expect(extracted.text).toBe(reviewJson("compatibility"));
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ category: "compatibility" });
+  });
+
+  it("按多个 assistant 消息和多个 text block 顺序重组 regression_test Review", () => {
+    const review = reviewJson("regression_test");
+    const splitAt = Math.floor(review.length / 2);
+    const stdout = [
+      JSON.stringify({ type: "session", id: "session-2" }),
+      ndjsonMessage({
+        role: "toolResult",
+        content: [{ type: "text", text: review }]
+      }),
+      ndjsonMessage({
+        role: "assistant",
+        content: [
+          { type: "thinking", text: "忽略" },
+          { type: "text", text: review.slice(0, splitAt) }
+        ]
+      }),
+      ndjsonMessage({
+        role: "assistant",
+        content: [{ type: "text", text: review.slice(splitAt) }]
+      }),
+      JSON.stringify({ type: "turn_end", isTerminal: true })
+    ].join("\n");
+
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.findings[0]).toMatchObject({ category: "regression_test" });
+  });
+
+  it("超过 256 KiB 的真实形状 NDJSON 仍能读取尾部 ReviewResult", () => {
+    const filler = JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", name: "read", arguments: { path: "src/users.py" } }]
+      }
+    });
+    const stdout = [
+      JSON.stringify({ type: "session", id: "session-large" }),
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_end", content: "前部 thinking" }
+      }),
+      ...Array.from({ length: 5000 }, () => filler),
+      ndjsonMessage({
+        role: "assistant",
+        content: [{ type: "text", text: reviewJson("compatibility") }]
+      }),
+      JSON.stringify({ type: "turn_end", isTerminal: true })
+    ].join("\n");
+
+    expect(Buffer.byteLength(stdout, "utf8")).toBeGreaterThan(256 * 1024);
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.findings[0]).toMatchObject({ category: "compatibility" });
+  });
+
+  it("assistant 文本不是完整 JSON 时失败关闭并保留 fallback 原因", () => {
+    const stdout = [
+      JSON.stringify({ type: "session", id: "session-3" }),
+      ndjsonMessage({
+        role: "assistant",
+        content: [
+          { type: "text", text: "这不是 " },
+          { type: "text", text: "JSON" }
+        ]
+      }),
+      JSON.stringify({ type: "turn_end", isTerminal: true })
+    ].join("\n");
+
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ priority: "P1", category: "other" });
+    expect(result.findings[0]?.message).toContain("assistant 文本不是完整 ReviewResult JSON");
+    expect(result.findings[0]?.message).toContain('"outputMode":"ndjson"');
+    expect(result.findings[0]?.message).toContain('"textSegmentCount":2');
+  });
+
+  it("缺少 terminal assistant message 时失败关闭", () => {
+    const stdout = [
+      JSON.stringify({ type: "session", id: "session-4" }),
+      JSON.stringify({ type: "turn_end", isTerminal: true })
+    ].join("\n");
+
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]?.category).toBe("other");
+    expect(result.findings[0]?.message).toContain("未找到 terminal assistant message");
+  });
+
   it("整段 stdout 是合法 JSON 时直接解析", () => {
     const stdout = JSON.stringify({
       verdict: "ship",
-      findings: [{ priority: "P3", confidence: 0.4, message: "建议补充测试" }],
+      findings: [{ priority: "P3", confidence: 0.4, category: "maintainability", message: "建议补充测试" }],
+      rootCause: {
+        text: "旧版返回结构被新实现覆盖",
+        confidence: 0.9,
+        evidenceIds: ["e-1"]
+      },
+      applicabilityConditions: [
+        {
+          text: "必须兼容旧版客户端",
+          evidenceIds: ["e-1"],
+          required: true
+        }
+      ],
       summary: "可以发布"
     });
     const result = extractReviewResult(stdout, sampleReviewInput());
@@ -624,16 +823,145 @@ describe("extractReviewResult", () => {
     expect(result.summary).toBe("可以发布");
   });
 
-  it("stdout 包含 JSON + 额外文本时提取平衡花括号子串", () => {
-    const stdout = `Here is my review:\n{"verdict":"block","findings":[{"priority":"P0","confidence":0.9,"message":"数据损坏风险"}],"summary":"阻断"}\nDone.`;
+  it("stdout 包含前后说明文字时失败关闭且不泄露原文", () => {
+    const stdout = `Here is my review:\n${reviewJson("compatibility")}\n机密模型原文`;
     const result = extractReviewResult(stdout, sampleReviewInput());
     expect(result.verdict).toBe("block");
     expect(result.findings).toHaveLength(1);
-    expect(result.findings[0]).toMatchObject({ priority: "P0", message: "数据损坏风险" });
+    expect(result.findings[0]).toMatchObject({ priority: "P1", category: "other" });
+    expect(result.findings[0]?.message).toContain("jsonErrorCategory");
+    expect(result.findings[0]?.message).not.toContain("机密模型原文");
   });
 
-  it("JSON 中嵌套花括号也能正确平衡提取", () => {
-    const stdout = `prefix {"verdict":"ship_with_fixes","findings":[{"priority":"P2","confidence":0.7,"message":"obj {nested}","locator":"a.ts:10"}],"summary":"ok"} suffix`;
+  it("单层完整 Markdown JSON 围栏按确定性规则通过", () => {
+    const stdout = `\`\`\`json\n${reviewJson("regression_test")}\n\`\`\``;
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ category: "regression_test" });
+  });
+
+  it("仅结束 Markdown 围栏且正文是完整 JSON 时通过", () => {
+    const stdout = `${reviewJson("regression_test")}\n\`\`\``;
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ category: "regression_test" });
+  });
+
+  it("仅起始 Markdown 围栏且正文是完整 JSON 时通过", () => {
+    const stdout = `\`\`\`json\n${reviewJson("compatibility")}`;
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ category: "compatibility" });
+  });
+
+  it("说明文字加结束围栏时失败关闭", () => {
+    const stdout = `说明文字\n${reviewJson("compatibility")}\n\`\`\``;
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]?.category).toBe("other");
+    const message = result.findings[0]?.message ?? "";
+    expect(message).toContain('"normalizationForm":"invalid_fence"');
+    expect(message).toContain('"closingFenceOnLastLine":true');
+    expect(message).toContain('"objectStartsWithBrace":false');
+    expect(message).toContain('"objectEndsWithBrace":true');
+    expect(message).toContain('"internalFence":false');
+    expect(message).toContain('"outputMode":"text"');
+    expect(message).toContain('"textSegmentCount":1');
+  });
+
+  it("结束围栏不在最后一行时失败关闭并记录边界形态", () => {
+    const stdout = `${reviewJson("compatibility")}\n\`\`\`\n尾部说明`;
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]?.category).toBe("other");
+    const message = result.findings[0]?.message ?? "";
+    expect(message).toContain('"normalizationForm":"invalid_fence"');
+    expect(message).toContain('"closingFenceOnLastLine":false');
+    expect(message).toContain('"objectStartsWithBrace":true');
+    expect(message).toContain('"objectEndsWithBrace":false');
+    expect(message).toContain('"internalFence":true');
+    expect(message).toContain('"outputMode":"text"');
+    expect(message).toContain('"textSegmentCount":1');
+  });
+
+  it("起始围栏后附加说明文字时失败关闭", () => {
+    const stdout = `\`\`\`json\n${reviewJson("regression_test")}\n说明文字`;
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]?.category).toBe("other");
+    expect(result.findings[0]?.message).toContain('"normalizationForm":"invalid_fence"');
+  });
+
+  it("合法 schema JSON 内嵌三反引号时仍失败关闭且不泄露原文", () => {
+    const secretText = "机密```模型原文";
+    const stdout = JSON.stringify({
+      verdict: "block",
+      findings: [
+        {
+          priority: "P1",
+          confidence: 0.9,
+          category: "compatibility",
+          message: secretText
+        }
+      ],
+      summary: `摘要 ${secretText}`
+    });
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ priority: "P1", category: "other" });
+    expect(result.findings[0]?.message).toContain('"normalizationForm":"invalid_fence"');
+    expect(result.findings[0]?.message).toContain("markdown_fence_invalid");
+    expect(result.findings[0]?.message).toContain('"internalFence":true');
+    expect(result.findings[0]?.message).toContain('"outputMode":"text"');
+    expect(result.findings[0]?.message).toContain('"textSegmentCount":1');
+    expect(result.findings[0]?.message).not.toContain(secretText);
+    expect(result.summary).not.toContain(secretText);
+  });
+
+  it("双层 Markdown 围栏失败关闭", () => {
+    const inner = `\`\`\`json\n${reviewJson("compatibility")}\n\`\`\``;
+    const stdout = `\`\`\`json\n${inner}\n\`\`\``;
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]?.category).toBe("other");
+    expect(result.findings[0]?.message).toContain("markdown_fence_invalid");
+    expect(result.findings[0]?.message).toContain('"normalizationForm":"invalid_fence"');
+  });
+
+  it("不完整 JSON 失败关闭并报告形态类别", () => {
+    const stdout = '{"verdict":"block","findings":[';
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]?.category).toBe("other");
+    expect(result.findings[0]?.message).toContain("incomplete_json");
+  });
+
+  it("合法 JSON 内的嵌套花括号不影响严格解析", () => {
+    const stdout = JSON.stringify({
+      verdict: "ship_with_fixes",
+      findings: [
+        {
+          priority: "P2",
+          confidence: 0.7,
+          category: "maintainability",
+          message: "obj {nested}",
+          locator: "a.ts:10"
+        }
+      ],
+      rootCause: {
+        text: "旧版返回结构被新实现覆盖",
+        confidence: 0.9,
+        evidenceIds: ["e-1"]
+      },
+      applicabilityConditions: [
+        {
+          text: "必须兼容旧版客户端",
+          evidenceIds: ["e-1"],
+          required: true
+        }
+      ],
+      summary: "ok"
+    });
     const result = extractReviewResult(stdout, sampleReviewInput());
     expect(result.verdict).toBe("ship_with_fixes");
     expect(result.findings[0]).toMatchObject({ priority: "P2", message: "obj {nested}", locator: "a.ts:10" });
@@ -645,39 +973,84 @@ describe("extractReviewResult", () => {
     expect(result.verdict).toBe("block");
   });
 
-  it("findings 字段缺失时返回空数组", () => {
+  it("findings 字段缺失时失败关闭", () => {
     const stdout = JSON.stringify({ verdict: "ship", summary: "ok" });
     const result = extractReviewResult(stdout, sampleReviewInput());
-    expect(result.findings).toEqual([]);
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ priority: "P1", category: "other" });
   });
 
-  it("finding 缺少 priority 时被过滤", () => {
+  it("解析 Phase 5 Review finding 分类和 Repair Memory 字段", () => {
     const stdout = JSON.stringify({
       verdict: "ship",
       findings: [
-        { priority: "P1", confidence: 0.5, message: "ok" },
+        {
+          priority: "P2",
+          confidence: 0.8,
+          category: "regression_test",
+          message: "缺少回归测试",
+          locator: "tests/users.test.js:12"
+        }
+      ],
+      rootCause: {
+        text: "旧版字段被新实现覆盖",
+        confidence: 0.9,
+        evidenceIds: ["e-1"]
+      },
+      fixSummary: "恢复字段并增加测试",
+      applicabilityConditions: [
+        {
+          text: "旧版客户端仍存在",
+          evidenceIds: ["e-1"],
+          required: true
+        }
+      ],
+      summary: "需要人工关注回归测试"
+    });
+    const result = extractReviewResult(stdout, sampleReviewInput());
+    expect(result.findings[0]).toMatchObject({ category: "regression_test" });
+    expect(result.rootCause).toEqual({
+      text: "旧版字段被新实现覆盖",
+      confidence: 0.9,
+      evidenceIds: ["e-1"]
+    });
+    expect(result.fixSummary).toBe("恢复字段并增加测试");
+    expect(result.applicabilityConditions).toEqual([
+      {
+        text: "旧版客户端仍存在",
+        evidenceIds: ["e-1"],
+        required: true
+      }
+    ]);
+  });
+
+  it("finding 缺少或非法 category 时失败关闭", () => {
+    const stdout = JSON.stringify({
+      verdict: "ship",
+      findings: [
+        { priority: "P1", confidence: 0.5, category: "correctness", message: "ok" },
         { priority: "P5", message: "invalid priority" },
         { message: "missing priority" }
       ],
       summary: "ok"
     });
     const result = extractReviewResult(stdout, sampleReviewInput());
-    expect(result.findings).toHaveLength(1);
-    expect(result.findings[0]).toMatchObject({ priority: "P1" });
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ priority: "P1", category: "other" });
   });
 
-  it("confidence 越界时被 clamp 到 [0,1]", () => {
+  it("confidence 越界时失败关闭", () => {
     const stdout = JSON.stringify({
       verdict: "block",
       findings: [
-        { priority: "P0", confidence: 1.5, message: "high" },
-        { priority: "P1", confidence: -0.3, message: "low" }
+        { priority: "P0", confidence: 1.5, category: "security", message: "high" },
+        { priority: "P1", confidence: -0.3, category: "correctness", message: "low" }
       ],
       summary: "x"
     });
     const result = extractReviewResult(stdout, sampleReviewInput());
-    expect(result.findings[0]!.confidence).toBe(1);
-    expect(result.findings[1]!.confidence).toBe(0);
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]!.category).toBe("other");
   });
 
   it("完全无法解析时回退到 block + P1 finding", () => {
@@ -761,16 +1134,55 @@ describe("OmpAdapter analyze/develop/review/cancel 行为", () => {
   it("review 在 omp 成功返回合法 JSON 时返回 ReviewResult", async () => {
     const stdout = JSON.stringify({
       verdict: "ship",
-      findings: [{ priority: "P3", confidence: 0.6, message: "建议补充测试", locator: "src/users.py:10" }],
+      findings: [{ priority: "P3", confidence: 0.6, category: "maintainability", message: "建议补充测试", locator: "src/users.py:10" }],
+      rootCause: {
+        text: "旧版返回结构被新实现覆盖",
+        confidence: 0.9,
+        evidenceIds: ["e-1"]
+      },
+      applicabilityConditions: [
+        {
+          text: "必须兼容旧版客户端",
+          evidenceIds: ["e-1"],
+          required: true
+        }
+      ],
       summary: "修复正确，测试通过"
     });
     const runner = makeStubRunner({ stdout });
     const omp = makeOmpAdapter({ processRunner: runner });
     const result = await omp.review(sampleReviewInput());
+    const modeIdx = runner.lastArgv!.indexOf("--mode");
+    expect(runner.lastArgv![modeIdx + 1]).toBe("text");
     expect(result.verdict).toBe("ship");
     expect(result.findings).toHaveLength(1);
     expect(result.findings[0]).toMatchObject({ priority: "P3", locator: "src/users.py:10" });
     expect(result.summary).toBe("修复正确，测试通过");
+  });
+
+  it("review 通过真实 argv 传递无围栏的严格 JSON 输出协议", async () => {
+    const runner = makeStubRunner({
+      stdout: JSON.stringify({ verdict: "block", findings: [], summary: "需要人工复核" })
+    });
+    const omp = makeOmpAdapter({ processRunner: runner });
+
+    await omp.review(sampleReviewInput());
+
+    const argv = runner.lastArgv!;
+    const prompt = argv[argv.length - 1]!;
+    const outputRequirementsStart = prompt.indexOf("## 输出要求");
+    const reviewPointsStart = prompt.indexOf("## 评审要点");
+    expect(outputRequirementsStart).toBeGreaterThanOrEqual(0);
+    expect(reviewPointsStart).toBeGreaterThan(outputRequirementsStart);
+
+    const outputRequirements = prompt.slice(outputRequirementsStart, reviewPointsStart);
+    expect(outputRequirements).not.toContain("```");
+    expect(outputRequirements).toContain(buildReviewResultOutputExample());
+    expect(outputRequirements).toContain("只输出一个 JSON 对象");
+    expect(outputRequirements).toContain("不得包含任何额外文本");
+    expect(outputRequirements).toContain("首字符必须是 `{`");
+    expect(outputRequirements).toContain("末字符必须是 `}`");
+    expect(outputRequirements).toContain("不要输出 Markdown JSON 围栏");
   });
 
   it("review 在 omp 返回非 JSON 文本时回退到 block", async () => {
@@ -779,6 +1191,25 @@ describe("OmpAdapter analyze/develop/review/cancel 行为", () => {
     const result = await omp.review(sampleReviewInput());
     expect(result.verdict).toBe("block");
     expect(result.findings[0]!.priority).toBe("P1");
+  });
+
+  it("review 发现输出截断时失败关闭并保留截断指标", async () => {
+    const runner = makeStubRunner({
+      stdout: JSON.stringify({ verdict: "ship", findings: [], summary: "ok" }),
+      truncated: true,
+      originalBytes: 1037301,
+      retainedBytes: 262144
+    });
+    const omp = makeOmpAdapter({ processRunner: runner });
+    const result = await omp.review(sampleReviewInput());
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ priority: "P1", category: "other" });
+    expect(result.findings[0]?.message).toContain("truncated=true");
+    expect(result.findings[0]?.message).toContain("originalBytes=1037301");
+    expect(result.findings[0]?.message).toContain("retainedBytes=262144");
+    expect(result.findings[0]?.message).toContain("stdoutBytes=");
+    expect(result.findings[0]?.message).toContain("markdownFenceStart=false");
+    expect(result.findings[0]?.message).toContain("markdownFenceEnd=false");
   });
 
   it("review 在 omp 超时时抛 OmpUnavailableError", async () => {

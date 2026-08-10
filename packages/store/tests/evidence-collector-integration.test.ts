@@ -25,6 +25,7 @@ import {
   TaskOrchestrator,
   EvidenceRouter,
   EvidenceCollector,
+  computePackContentHash,
   type Project,
   type TaskInput
 } from "@tracepilot/core";
@@ -446,8 +447,61 @@ describe("EvidenceCollector 端到端集成 (P1-05)", () => {
       taskId: "seed-task-ec"
     });
 
+    const packWithoutHash = {
+      id: "seed-pack",
+      taskId: seedTask.id,
+      version: 1,
+      taskSnapshot: seedTask.input,
+      evidence: [
+        {
+          id: "seed-evidence",
+          kind: "code" as const,
+          source: "integration-fixture",
+          locator: "fixture:add",
+          capturedAt: "2026-01-01T00:00:00.000Z",
+          contentHash: "sha256-seed-evidence",
+          summary: "add 函数返回值证据",
+          relevance: 1,
+          trustLevel: "PRIMARY" as const
+        }
+      ],
+      hypotheses: [
+        {
+          text: "add 函数返回了错误的值",
+          confidence: 0.9,
+          evidenceIds: ["seed-evidence"]
+        }
+      ],
+      constraints: [
+        {
+          text: "pytest 失败",
+          evidenceIds: ["seed-evidence"],
+          required: true
+        }
+      ],
+      acceptanceCriteria: seedTask.input.acceptanceCriteria,
+      createdAt: "2026-01-01T00:00:00.000Z"
+    };
+    const packContentHash = computePackContentHash(packWithoutHash);
+    const diffHash = "sha256-seed-diff";
+
     // 预填一条 APPROVED RepairRecord
     await store.unitOfWork.run(async (tx) => {
+      await tx.evidencePacks.save({ ...packWithoutHash, contentHash: packContentHash });
+      await tx.executionResults.save({
+        id: "seed-execution",
+        taskId: seedTask.id,
+        runId: "seed-run",
+        diffHash,
+        diffPatch: "diff --git a/add.py b/add.py",
+        diffChangedFiles: ["add.py"],
+        diffBytes: 32,
+        verificationExitCode: 0,
+        verificationPassed: true,
+        verificationStdout: "pytest 通过",
+        verificationStderr: "",
+        createdAt: "2026-01-01T00:00:00.000Z"
+      });
       await tx.repairRecords.save({
         id: "rec-001",
         projectId: "proj-ec",
@@ -455,11 +509,28 @@ describe("EvidenceCollector 端到端集成 (P1-05)", () => {
         status: "APPROVED",
         symptom: "assert add(1, 2) == 3",
         rootCause: "add 函数返回了错误的值",
+        rootCauseConfidence: 0.9,
+        rootCauseEvidenceIds: ["seed-evidence"],
         fixSummary: "修正 add 函数实现",
         applicabilityConditions: ["pytest 失败"],
+        applicabilityConditionEvidence: [
+          {
+            text: "pytest 失败",
+            evidenceIds: ["seed-evidence"],
+            required: true
+          }
+        ],
         failureReasons: [],
         inputEvidencePackId: "seed-pack",
         inputEvidencePackVersion: 1,
+        inputEvidencePackContentHash: packContentHash,
+        diffHash,
+        verificationResult: {
+          passed: true,
+          ranCommands: ["pytest"],
+          exitCodes: { pytest: 0 }
+        },
+        reviewResult: { verdict: "ship", findings: [] },
         createdAt: "2026-01-01T00:00:00.000Z",
         updatedAt: "2026-01-01T00:00:00.000Z"
       });

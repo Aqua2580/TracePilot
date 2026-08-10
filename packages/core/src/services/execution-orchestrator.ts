@@ -42,10 +42,16 @@ import type { WorktreeManager } from "./worktree-manager.js";
 import type { UnitOfWork } from "../ports/repositories.js";
 import type { Task, Plan, TaskStatus } from "../domain/task.js";
 import type { Project } from "../domain/project.js";
+import type { EvidencePack } from "../domain/evidence.js";
+import { computePackContentHash } from "../domain/evidence.js";
 import type { AgentRunRecord } from "../domain/agent-run.js";
 import type { ExecutionResult } from "../domain/execution-result.js";
 import type { Worktree } from "../ports/adapters.js";
 import { createAuditEvent, randomId } from "../domain/audit.js";
+import type {
+  HumanDecisionFinalizationGuard,
+  HumanDecisionFinalizationInput
+} from "../ports/human-decision-finalization.js";
 
 /**
  * RuntimeEventSink —— core 层定义的事件缓冲接口。
@@ -82,6 +88,14 @@ export interface ExecutionOrchestratorDeps {
    * 校验（§7.2 第 2 点的 fallback）。生产环境必须注入此依赖。
    */
   readonly filesystemGuard?: WorktreeFilesystemGuard;
+  /**
+   * 仅用于确定性竞态测试：在最后一次提交前 Diff 捕获后暂停或注入改动。
+   * 生产装配必须留空。
+   */
+  readonly approvalFinalizationHook?: (input: {
+    readonly taskId: string;
+    readonly diffHash: string;
+  }) => Promise<void>;
 }
 
 /** runAnalyze 返回值。 */
@@ -112,6 +126,7 @@ interface TaskContext {
   readonly worktree: Worktree;
   readonly plan: Plan;
   readonly project: Project;
+  readonly evidencePack: EvidencePack;
 }
 
 /**
@@ -129,7 +144,19 @@ async function loadTaskContext(tx: import("../ports/repositories.js").Transactio
   if (!plan) throw new Error(`Plan 不存在: ${task.currentPlanId}`);
   const project = await tx.projects.findById(task.projectId);
   if (!project) throw new Error(`项目不存在: ${task.projectId}`);
-  return { task, worktree, plan, project };
+  if (!task.currentEvidencePackId || task.currentEvidencePackVersion === undefined) {
+    throw new Error(`任务 ${taskId} 未绑定当前 Evidence Pack`);
+  }
+  const evidencePack = await tx.evidencePacks.findById(task.currentEvidencePackId);
+  if (
+    !evidencePack ||
+    evidencePack.taskId !== task.id ||
+    evidencePack.version !== task.currentEvidencePackVersion ||
+    evidencePack.contentHash !== computePackContentHash(evidencePack)
+  ) {
+    throw new Error(`任务 ${taskId} 的当前 Evidence Pack 不存在、归属不一致或内容哈希无效`);
+  }
+  return { task, worktree, plan, project, evidencePack };
 }
 
 /** 构造 RuntimeTaskInput。 */
@@ -138,8 +165,8 @@ function buildRuntimeTaskInput(ctx: TaskContext): RuntimeTaskInput {
     taskId: ctx.task.id,
     worktreePath: ctx.worktree.path,
     allowedPaths: ctx.plan.allowedPaths,
-    evidencePackId: ctx.task.currentEvidencePackId ?? `pack-${ctx.task.id}`,
-    evidencePackVersion: ctx.task.currentEvidencePackVersion ?? 1,
+    evidencePackId: ctx.evidencePack.id,
+    evidencePackVersion: ctx.evidencePack.version,
     taskInput: ctx.task.input,
     projectCommands: ctx.project.commands
   };
@@ -193,7 +220,7 @@ async function consumeRuntimeStream(
   return { runId, eventCount, summary, agentRun, errorEvent, completed };
 }
 
-export class ExecutionOrchestrator {
+export class ExecutionOrchestrator implements HumanDecisionFinalizationGuard {
   /**
    * P1-R02（§7.3 第 1 点）：执行租约登记 —— `taskId → AbortController`。
    *
@@ -220,6 +247,9 @@ export class ExecutionOrchestrator {
    * 子进程。
    */
   private readonly activeRuns = new Map<string, string>();
+
+  /** 同一任务的内部写入、Review 与最终审批共享一个进程内独占队列。 */
+  private readonly taskOperationTails = new Map<string, Promise<void>>();
 
   constructor(private readonly deps: ExecutionOrchestratorDeps) {}
 
@@ -300,6 +330,10 @@ export class ExecutionOrchestrator {
    *   与 COMMIT 之间无 yield，构成不可分割的线性化边界。
    */
   async runDevelop(taskId: string): Promise<DevelopRunResult> {
+    return this.runTaskExclusive(taskId, () => this.runDevelopExclusive(taskId));
+  }
+
+  private async runDevelopExclusive(taskId: string): Promise<DevelopRunResult> {
     // P1-R02：先创建 lease，再加载任务上下文 + 校验状态（关闭注册前竞态）。
     // §9.3：lease 持有到整个用例结束（最外层 finally 清理），覆盖 Diff/
     // 验证/持久化全程，使取消 API 在任何阶段都能通过 abort signal 终止。
@@ -921,6 +955,10 @@ export class ExecutionOrchestrator {
    * @throws {Error} 任务无对应的 execution_results 记录
    */
   async runReview(taskId: string): Promise<ReviewResult> {
+    return this.runTaskExclusive(taskId, () => this.runReviewExclusive(taskId));
+  }
+
+  private async runReviewExclusive(taskId: string): Promise<ReviewResult> {
     // P1-R02：先创建 lease，再加载任务上下文 + 校验状态（关闭注册前竞态）。
     const controller = new AbortController();
     this.pendingLeases.set(taskId, controller);
@@ -978,8 +1016,9 @@ export class ExecutionOrchestrator {
       const input: ReviewTaskInput = {
         taskId: ctx.task.id,
         worktreePath: ctx.worktree.path,
-        evidencePackId: ctx.task.currentEvidencePackId ?? `pack-${ctx.task.id}`,
-        evidencePackVersion: ctx.task.currentEvidencePackVersion ?? 1,
+        evidencePackId: ctx.evidencePack.id,
+        evidencePackVersion: ctx.evidencePack.version,
+        evidencePack: ctx.evidencePack,
         taskInput: ctx.task.input,
         diff,
         verificationResult,
@@ -988,6 +1027,185 @@ export class ExecutionOrchestrator {
       return await this.deps.runtime.review(input, controller.signal);
     } finally {
       this.pendingLeases.delete(taskId);
+    }
+  }
+
+  /**
+   * 在同一任务级独占关键区内完成最终 Diff 捕获、领域提交和提交后复核。
+   *
+   * 进程内所有 develop/review/审批路径共享同一互斥队列；同时把整个
+   * worktree 临时设为只读并拍摄文件系统快照。外部进程若仍能在 Windows
+   * 只读目录中新建文件，提交后 Diff + 快照复核会检测并调用补偿事务，
+   * 删除人工审批、恢复 VERIFIED/等待审批状态后失败关闭。
+   */
+  async finalize<T>(input: HumanDecisionFinalizationInput<T>): Promise<T> {
+    return this.runTaskExclusive(input.taskId, async () => {
+      const filesystemGuard = this.deps.filesystemGuard;
+      if (!filesystemGuard) {
+        throw new HumanDecisionFinalizationError(
+          input.taskId,
+          "生产审批未配置 WorktreeFilesystemGuard"
+        );
+      }
+
+      const ctx = await this.loadApprovalDiffContext(input.taskId);
+      let isolationLease: ExecutionIsolationLease | undefined;
+      let beforeSnapshot: FilesystemSnapshot | undefined;
+      let afterSnapshot: FilesystemSnapshot | undefined;
+      let committed = false;
+      let committedValue: T | undefined;
+
+      try {
+        // 空 allowlist 表示审批期间禁止 TracePilot 内部和普通外部写入。
+        isolationLease = await filesystemGuard.applyExecutionIsolation(
+          ctx.worktree.path,
+          []
+        );
+        beforeSnapshot = await filesystemGuard.createSnapshot(ctx.worktree.path);
+
+        const beforeDiff = await this.captureAndAssertApprovalDiff(
+          ctx,
+          input.expectedDiffHash,
+          "人工审批关键区：提交前最终 Diff 捕获"
+        );
+
+        // 确定性测试在此处注入“Diff 已返回、SQLite 提交前”的竞态。
+        await this.deps.approvalFinalizationHook?.({
+          taskId: input.taskId,
+          diffHash: beforeDiff.hash
+        });
+
+        committedValue = await input.commit();
+        committed = true;
+
+        const afterDiff = await this.captureAndAssertApprovalDiff(
+          ctx,
+          input.expectedDiffHash,
+          "人工审批关键区：提交后 Diff 复核"
+        );
+        afterSnapshot = await filesystemGuard.createSnapshot(ctx.worktree.path);
+        const filesystemChanges = filesystemGuard.detectChanges(
+          beforeSnapshot,
+          afterSnapshot
+        );
+        if (filesystemChanges.length > 0) {
+          throw new DiffTamperError(
+            input.taskId,
+            input.expectedDiffHash,
+            `${afterDiff.hash}; filesystem=${filesystemChanges
+              .map((change) => change.relativePath)
+              .join(",")}`
+          );
+        }
+
+        return committedValue;
+      } catch (error) {
+        if (committed) {
+          try {
+            await input.compensate(committedValue as T);
+          } catch (compensationError) {
+            throw new HumanDecisionFinalizationError(
+              input.taskId,
+              `检测到审批竞态，但补偿失败：${(compensationError as Error).message}`,
+              { cause: error as Error }
+            );
+          }
+        }
+        throw error;
+      } finally {
+        if (afterSnapshot) await filesystemGuard.dispose(afterSnapshot);
+        if (beforeSnapshot) await filesystemGuard.dispose(beforeSnapshot);
+        await isolationLease?.release();
+      }
+    });
+  }
+
+  /**
+   * 在人工挑战签发或消费前重新读取登记 worktree 的当前 Diff。
+   *
+   * Review 结果和 execution_results 只代表 Review 时刻的快照；人工决定
+   * 不能只比较两份旧哈希。API 必须在挑战签发前和最终消费前调用本方法，
+   * 若 Review 后允许文件、新文件或原文件被改动，当前哈希不一致就失败关闭。
+   */
+  async assertReviewDiffStillCurrent(taskId: string): Promise<string> {
+    return this.runTaskExclusive(taskId, () =>
+      this.assertReviewDiffStillCurrentExclusive(taskId)
+    );
+  }
+
+  private async assertReviewDiffStillCurrentExclusive(taskId: string): Promise<string> {
+    const ctx = await this.loadApprovalDiffContext(taskId);
+    const currentDiff = await this.captureAndAssertApprovalDiff(
+      ctx,
+      ctx.persisted.diffHash,
+      "ExecutionOrchestrator.assertReviewDiffStillCurrent：人工审批前重新核验 Diff"
+    );
+    return currentDiff.hash;
+  }
+
+  private async loadApprovalDiffContext(taskId: string): Promise<{
+    readonly worktree: Worktree;
+    readonly persisted: ExecutionResult;
+  }> {
+    return this.deps.unitOfWork.run(async (tx) => {
+      const base = await loadTaskContext(tx, taskId);
+      if (base.task.status !== "AWAITING_HUMAN_APPROVAL") {
+        throw new TaskNotInExpectedStatusError(
+          taskId,
+          "AWAITING_HUMAN_APPROVAL",
+          base.task.status
+        );
+      }
+      const persisted = await tx.executionResults.findLatestByTask(taskId);
+      if (!persisted) {
+        throw new Error(`任务 ${taskId} 无受控 execution_results，拒绝人工审批`);
+      }
+      return { ...base, persisted };
+    });
+  }
+
+  private async captureAndAssertApprovalDiff(
+    ctx: { readonly worktree: Worktree; readonly persisted: ExecutionResult },
+    expectedDiffHash: string,
+    reason: string
+  ): Promise<DiffArtifact> {
+    const currentDiff = await this.deps.worktreeManager.captureDiffForTask({
+      taskId: ctx.persisted.taskId,
+      worktreeId: ctx.worktree.id,
+      reason
+    });
+    if (
+      ctx.persisted.diffHash !== expectedDiffHash ||
+      currentDiff.hash !== expectedDiffHash
+    ) {
+      throw new DiffTamperError(
+        ctx.persisted.taskId,
+        expectedDiffHash,
+        currentDiff.hash
+      );
+    }
+    return currentDiff;
+  }
+
+  private async runTaskExclusive<T>(
+    taskId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const previous = this.taskOperationTails.get(taskId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    this.taskOperationTails.set(taskId, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.taskOperationTails.get(taskId) === tail) {
+        this.taskOperationTails.delete(taskId);
+      }
     }
   }
 }
@@ -1009,6 +1227,14 @@ export class DiffTamperError extends Error {
       `任务 ${taskId} 的工作树 Diff 哈希 (${currentHash}) 与持久化哈希 (${persistedHash}) 不一致 —— 拒绝 Review，要求重新验证`
     );
     this.name = "DiffTamperError";
+  }
+}
+
+/** 人工审批关键区无法建立或竞态补偿失败。 */
+export class HumanDecisionFinalizationError extends Error {
+  constructor(taskId: string, message: string, options?: ErrorOptions) {
+    super(`任务 ${taskId} 的人工审批最终提交失败：${message}`, options);
+    this.name = "HumanDecisionFinalizationError";
   }
 }
 

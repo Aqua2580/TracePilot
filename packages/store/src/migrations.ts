@@ -1,7 +1,8 @@
 /**
  * 迁移机制 —— 见 IMPLEMENTATION_SPEC §3.1 与 ADR-005。
  *
- * 采用内联 SQL 迁移定义，不依赖 drizzle-kit 的生成器。原因：
+ * 采用内联 SQL 迁移定义；需要按领域规则读取旧数据时允许附加事务内 apply，
+ * 不依赖 drizzle-kit 的生成器。原因：
  * - MVP 单进程，schema 变更频率低。
  * - 避免引入额外的构建工具链依赖。
  * - schema.ts 仍作为 Drizzle 类型安全查询的来源。
@@ -11,19 +12,23 @@
  */
 
 import type { Database as DatabaseType } from "better-sqlite3";
+import type { RepairRecordRow } from "./sqlite-repositories.js";
+import { createTrustedRepairRecordResolver } from "./trusted-repair-record.js";
 
 /** 单条迁移定义：版本号 + SQL 语句。 */
 interface Migration {
   readonly version: number;
   readonly description: string;
   readonly sql: string;
+  /** 需要读取旧数据并执行领域校验时使用；与 sql 位于同一事务。 */
+  readonly apply?: (db: DatabaseType) => void;
 }
 
 /**
  * 已登记的迁移列表。新增迁移只能追加，不得修改已发布的迁移。
  *
  * 迁移 SQL 必须是幂等安全的 DDL（`CREATE TABLE IF NOT EXISTS`、
- * `CREATE INDEX IF NOT EXISTS`）。
+ * `CREATE INDEX IF NOT EXISTS`）；数据迁移 apply 也必须可重复执行且失败关闭。
  */
 const MIGRATIONS: readonly Migration[] = [
   {
@@ -220,15 +225,113 @@ const MIGRATIONS: readonly Migration[] = [
       );
       CREATE INDEX IF NOT EXISTS idx_execution_results_task ON execution_results(task_id);
     `
+  },
+  {
+    version: 5,
+    description: "repair_records 记录 Evidence Pack 内容哈希，绑定 Review 与 Repair Memory 来源",
+    sql: `
+      ALTER TABLE repair_records ADD COLUMN input_evidence_pack_content_hash TEXT;
+    `
+  },
+  {
+    version: 6,
+    description: "repair_records 持久化根因与适用条件的具体 Evidence ID 绑定",
+    sql: `
+      ALTER TABLE repair_records ADD COLUMN root_cause_confidence REAL;
+      ALTER TABLE repair_records ADD COLUMN root_cause_evidence_ids_json TEXT NOT NULL DEFAULT '[]';
+      ALTER TABLE repair_records ADD COLUMN applicability_evidence_json TEXT NOT NULL DEFAULT '[]';
+    `
+  },
+  {
+    version: 7,
+    description: "失败关闭隔离无法重新验证来源链的历史高可信 Repair Record",
+    sql: "",
+    apply: (db) => {
+      const rows = db
+        .prepare(
+          "SELECT * FROM repair_records WHERE status IN ('VERIFIED', 'APPROVED')"
+        )
+        .all() as RepairRecordRow[];
+      const resolveTrustedRecord = createTrustedRepairRecordResolver(db);
+      const deprecate = db.prepare(
+        `UPDATE repair_records
+         SET status = 'DEPRECATED', failure_reasons_json = ?, updated_at = ?
+         WHERE id = ? AND status IN ('VERIFIED', 'APPROVED')`
+      );
+      const migratedAt = new Date().toISOString();
+
+      for (const row of rows) {
+        if (resolveTrustedRecord(row).record) continue;
+        const failureReasons = parseFailureReasons(row.failure_reasons_json);
+        const migrationReason =
+          "迁移 7 隔离：历史高可信记录无法重新验证完整 Evidence Pack、Diff 与验证来源链";
+        if (!failureReasons.includes(migrationReason)) {
+          failureReasons.push(migrationReason);
+        }
+        deprecate.run(JSON.stringify(failureReasons), migratedAt, row.id);
+      }
+    }
+  },
+  {
+    version: 8,
+    description: "隔离 Task 项目归属与 Repair Record 项目不一致的历史高可信记录",
+    sql: "",
+    apply: (db) => {
+      const rows = db
+        .prepare(
+          "SELECT * FROM repair_records WHERE status IN ('VERIFIED', 'APPROVED')"
+        )
+        .all() as RepairRecordRow[];
+      const resolveTrustedRecord = createTrustedRepairRecordResolver(db);
+      const deprecate = db.prepare(
+        `UPDATE repair_records
+         SET status = 'DEPRECATED', failure_reasons_json = ?, updated_at = ?
+         WHERE id = ? AND status IN ('VERIFIED', 'APPROVED')`
+      );
+      const migratedAt = new Date().toISOString();
+
+      for (const row of rows) {
+        if (resolveTrustedRecord(row).record) continue;
+        const failureReasons = parseFailureReasons(row.failure_reasons_json);
+        const migrationReason =
+          "迁移 8 隔离：高可信记录的 Task 项目归属或完整来源链无法重新验证";
+        if (!failureReasons.includes(migrationReason)) {
+          failureReasons.push(migrationReason);
+        }
+        deprecate.run(JSON.stringify(failureReasons), migratedAt, row.id);
+      }
+    }
   }
 ];
+
+function parseFailureReasons(serialized: string): string[] {
+  try {
+    const parsed = JSON.parse(serialized) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter(
+          (reason): reason is string =>
+            typeof reason === "string" && reason.trim().length > 0
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export interface RunMigrationsOptions {
+  /** 仅供真实升级集成测试构造历史版本；生产启动始终省略并升级到最新。 */
+  readonly throughVersion?: number;
+}
 
 /**
  * 运行未应用的迁移。每条迁移在独立事务中执行。
  *
  * 返回已应用的迁移版本列表（按版本升序）。
  */
-export function runMigrations(db: DatabaseType): number[] {
+export function runMigrations(
+  db: DatabaseType,
+  options: RunMigrationsOptions = {}
+): number[] {
   // 确保 schema_migrations 表存在（首次启动时可能还没有）。
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -239,12 +342,26 @@ export function runMigrations(db: DatabaseType): number[] {
 
   const applied = getAppliedVersions(db);
   const appliedSet = new Set(applied);
+  const throughVersion = options.throughVersion ?? Number.POSITIVE_INFINITY;
+  if (!Number.isInteger(throughVersion) && throughVersion !== Number.POSITIVE_INFINITY) {
+    throw new Error("迁移目标版本必须是整数");
+  }
+  if (
+    throughVersion !== Number.POSITIVE_INFINITY &&
+    (throughVersion < 1 || throughVersion > getLatestMigrationVersion())
+  ) {
+    throw new Error(`迁移目标版本超出范围：${throughVersion}`);
+  }
 
   const newlyApplied: number[] = [];
   for (const migration of MIGRATIONS) {
+    if (migration.version > throughVersion) continue;
     if (appliedSet.has(migration.version)) continue;
     const tx = db.transaction(() => {
-      db.exec(migration.sql);
+      if (migration.sql.trim().length > 0) {
+        db.exec(migration.sql);
+      }
+      migration.apply?.(db);
       db.prepare(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
       ).run(migration.version, new Date().toISOString());

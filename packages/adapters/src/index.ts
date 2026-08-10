@@ -21,6 +21,8 @@ export {
   OmpUnavailableError,
   OmpArgvValidationError,
   parseOmpNdjsonEvents,
+  extractAssistantTextFromOmpNdjson,
+  buildReviewResultOutputExample,
   extractReviewResult,
   extractFileChangesFromStdout,
   extractFileChangesFromText,

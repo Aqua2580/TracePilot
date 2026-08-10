@@ -9,10 +9,14 @@
 import type { CommandSpec, ProjectCommands } from "../domain/project.js";
 import type {
   EvidencePackId,
-  EvidencePackVersion
+  EvidencePackVersion,
+  Hypothesis,
+  EvidenceConstraint
 } from "../domain/evidence.js";
+import type { EvidencePack } from "../domain/evidence.js";
 import type { TaskInput } from "../domain/task.js";
 import type { RepairRecord } from "../domain/repair-record.js";
+import type { ReviewFinding } from "../domain/repair-record.js";
 import type { RepositoryInfo } from "../domain/project.js";
 import type { OutputTruncation } from "../domain/audit.js";
 
@@ -187,6 +191,8 @@ export interface ReviewTaskInput {
   readonly worktreePath: string;
   readonly evidencePackId: EvidencePackId;
   readonly evidencePackVersion: EvidencePackVersion;
+  /** Reviewer 实际消费的不可变 Evidence Pack 快照，而不是只有其 ID。 */
+  readonly evidencePack: EvidencePack;
   readonly taskInput: TaskInput;
   readonly diff: DiffArtifact;
   readonly verificationResult: unknown;
@@ -203,13 +209,17 @@ export type RuntimeEvent =
 
 export interface ReviewResult {
   readonly verdict: "ship" | "ship_with_fixes" | "block";
-  readonly findings: ReadonlyArray<{
-    readonly priority: "P0" | "P1" | "P2" | "P3";
-    readonly confidence: number;
-    readonly message: string;
-    readonly locator?: string;
-  }>;
+  readonly findings: ReadonlyArray<ReviewFinding>;
   readonly summary: string;
+  /**
+   * Reviewer 选择的 Pack hypothesis。Core 会要求其 text、confidence 与
+   * evidenceIds 精确匹配当前不可变 Pack，禁止模型临时新造正式根因。
+   */
+  readonly rootCause?: Hypothesis;
+  /** Reviewer 对本次修改的结构化摘要；缺失时使用 summary。 */
+  readonly fixSummary?: string;
+  /** 只能引用当前 Pack 中已登记且带 Evidence ID 的约束。 */
+  readonly applicabilityConditions?: readonly EvidenceConstraint[];
 }
 
 export interface RuntimeAdapter {
@@ -264,6 +274,45 @@ export interface MemoryQuery {
   readonly maxResults?: number;
   /** 默认仅召回 APPROVED 状态的记录（§5.4）。 */
   readonly minStatus?: "VERIFIED" | "APPROVED";
+}
+
+export class MemoryQueryValidationError extends Error {
+  constructor(message: string) {
+    super(`Repair Memory 查询无效：${message}`);
+    this.name = "MemoryQueryValidationError";
+  }
+}
+
+/** 所有 KnowledgeAdapter 共用的运行时查询边界。 */
+export function assertMemoryQuery(query: unknown): asserts query is MemoryQuery {
+  if (!query || typeof query !== "object" || Array.isArray(query)) {
+    throw new MemoryQueryValidationError("query 必须是对象");
+  }
+  const value = query as Record<string, unknown>;
+  if (typeof value.projectId !== "string" || value.projectId.trim().length === 0) {
+    throw new MemoryQueryValidationError("projectId 必须是非空字符串");
+  }
+  if (
+    value.minStatus !== undefined &&
+    value.minStatus !== "VERIFIED" &&
+    value.minStatus !== "APPROVED"
+  ) {
+    throw new MemoryQueryValidationError("minStatus 只能是 VERIFIED 或 APPROVED");
+  }
+  if (
+    value.maxResults !== undefined &&
+    (typeof value.maxResults !== "number" ||
+      !Number.isInteger(value.maxResults) ||
+      (value.maxResults as number) < 1 ||
+      (value.maxResults as number) > 100)
+  ) {
+    throw new MemoryQueryValidationError("maxResults 必须是 1 到 100 的整数");
+  }
+  for (const field of ["symptom", "rootCause"] as const) {
+    if (value[field] !== undefined && typeof value[field] !== "string") {
+      throw new MemoryQueryValidationError(`${field} 必须是字符串`);
+    }
+  }
 }
 
 export interface KnowledgeAdapter {
@@ -325,8 +374,27 @@ export interface CommandResult {
   readonly originalBytes: number;
   readonly retainedBytes: number;
   readonly timedOut: boolean;
+  /**
+   * 取消或超时触发进程树终止时的脱敏结果。自然结束的命令不设置此字段。
+   */
+  readonly termination?: ProcessTerminationResult;
   readonly startedAt: string;
   readonly endedAt: string;
+}
+
+export interface ProcessTerminationResult {
+  /** 是否确实发起过终止请求。 */
+  readonly requested: boolean;
+  /** 使用的终止方式。Windows 生产路径为 taskkill。 */
+  readonly method: "taskkill" | "process_group" | "child";
+  /** 终止命令是否完成且返回成功。 */
+  readonly completed: boolean;
+  /** 终止命令的退出码；无法取得时省略。 */
+  readonly exitCode?: number;
+  /** 失败原因只允许固定类别，不记录命令输出。 */
+  readonly failure?: "spawn_error" | "nonzero_exit" | "timeout";
+  /** taskkill 失败后是否尝试过直接终止主进程。 */
+  readonly fallbackAttempted?: boolean;
 }
 
 export interface ProcessRunner {

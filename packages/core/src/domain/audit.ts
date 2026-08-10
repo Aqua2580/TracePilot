@@ -20,6 +20,7 @@ export type AuditEventType =
   | "execution_approval_invalidated"
   | "human_approval_granted"
   | "human_approval_rejected"
+  | "human_approval_invalidated"
   | "command_executed"
   | "worktree_created"
   | "worktree_removed"

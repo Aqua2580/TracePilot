@@ -101,8 +101,17 @@ function seedMemoryRecord(fixture: BenchmarkFixture): RepairRecord {
     status: "APPROVED",
     symptom: fixture.taskInput.objective,
     rootCause: "历史相似根因",
+    rootCauseConfidence: 0.9,
+    rootCauseEvidenceIds: [`seed-evidence-${fixture.id}`],
     fixSummary: "历史修复摘要",
     applicabilityConditions: ["python"],
+    applicabilityConditionEvidence: [
+      {
+        text: "python",
+        evidenceIds: [`seed-evidence-${fixture.id}`],
+        required: true
+      }
+    ],
     failureReasons: ["未处理边界"],
     inputEvidencePackId: `seed-pack-${fixture.id}`,
     inputEvidencePackVersion: 1,

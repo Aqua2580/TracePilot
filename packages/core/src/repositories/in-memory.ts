@@ -270,6 +270,9 @@ export class InMemoryApprovalRepository implements ApprovalRepository {
   async save(approval: ApprovalRecord): Promise<void> {
     this.table.set(approval);
   }
+  async delete(id: string): Promise<void> {
+    this.table.delete(id);
+  }
   async findByTask(taskId: string): Promise<ApprovalRecord[]> {
     return this.table
       .values()

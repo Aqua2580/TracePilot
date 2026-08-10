@@ -15,7 +15,8 @@
 
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { execFileSync, execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { buildCompositionRoot } from "../src/composition-root.js";
@@ -738,7 +739,7 @@ describe("P1-R02-E：HTTP API 取消与异常状态迁移", () => {
     // 本测试使用真实 LocalProcessRunner（不注入 processRunnerOverride）+
     // 真实阻塞 node 子进程作为验证命令，验证取消信号能通过 taskkill /T /F
     // 终止整棵验证进程树。
-    it("/cancel 使用真实子进程验证：Runtime completed 后终止真实验证进程树", async () => {
+    it("/cancel 使用真实子进程验证：Runtime completed 后终止真实验证进程树", { timeout: 15000 }, async () => {
       const runtime = new CompletingRuntimeAdapter();
 
       // 创建临时 worktree 根目录 + worktree 子目录
@@ -753,18 +754,26 @@ describe("P1-R02-E：HTTP API 取消与异常状态迁移", () => {
       // 创建阻塞型验证脚本：写入 PID 到 lockfile 后无限循环
       const lockfilePath = join(worktreePath, ".verify-pid-lock");
       const scriptPath = join(worktreePath, "block-verify.js");
+      const identityToken = `tracepilot-real-cancel-${randomUUID()}`;
       writeFileSync(scriptPath, [
         "const fs = require('fs');",
         "const path = require('path');",
-        `fs.writeFileSync(${JSON.stringify(lockfilePath)}, String(process.pid));`,
+        `fs.writeFileSync(${JSON.stringify(lockfilePath)}, JSON.stringify({ pid: process.pid, token: process.argv[2] }));`,
         "setInterval(() => {}, 1000);"
       ].join("\n"));
+      // LocalGitAdapter 会把未跟踪文件纳入最终 Diff；阻塞脚本属于测试基线，
+      // 必须先提交，避免它被误判为 Runtime 新增的越界候选变更。
+      execSync("git add block-verify.js", { cwd: worktreePath, stdio: "ignore" });
+      execSync('git commit -m "add verification fixture"', {
+        cwd: worktreePath,
+        stdio: "ignore"
+      });
 
       // 项目 test 命令改为 node block-verify.js
       const realProject: Project = {
         ...sampleProject(),
         commands: {
-          test: { argv: ["node", "block-verify.js"], timeoutMs: 300000 }
+          test: { argv: ["node", "block-verify.js", identityToken], timeoutMs: 300000 }
         }
       };
 
@@ -799,14 +808,25 @@ describe("P1-R02-E：HTTP API 取消与异常状态迁移", () => {
         let verifyPid: string | undefined;
         for (let i = 0; i < 100; i++) {
           if (existsSync(lockfilePath)) {
-            verifyPid = readFileSync(lockfilePath, "utf8").trim();
-            break;
+            try {
+              const lock = JSON.parse(readFileSync(lockfilePath, "utf8")) as {
+                pid?: unknown;
+                token?: unknown;
+              };
+              if (lock.token === identityToken && typeof lock.pid === "number" && Number.isSafeInteger(lock.pid)) {
+                verifyPid = String(lock.pid);
+                break;
+              }
+            } catch {
+              // 文件刚创建但尚未读完整时，继续轮询。
+            }
           }
           await new Promise((r) => setTimeout(r, 100));
         }
         if (!verifyPid) {
           throw new Error("验证子进程未在 10 秒内启动（lockfile 未创建）");
         }
+        expect(getProcessIdentityStatus(verifyPid, identityToken)).toBe("running");
 
         // 核心断言（§9.3 真实子进程）：Runtime 已 completed，
         // 真实验证子进程正在运行。/cancel 应终止整棵进程树。
@@ -821,12 +841,10 @@ describe("P1-R02-E：HTTP API 取消与异常状态迁移", () => {
         const developRes = await developPromise;
         expect([409, 500].includes(developRes.statusCode)).toBe(true);
 
-        // 等待进程树终止（taskkill /T /F 是同步的，但事件循环需时间传播）
-        await new Promise((r) => setTimeout(r, 500));
-
-        // 验证真实验证子进程已被终止
-        const stillRunning = isProcessRunning(verifyPid);
-        expect(stillRunning).toBe(false);
+        // 轮询验证进程树已终止，设置总超时，避免固定 sleep 受 Windows 调度影响。
+        const terminated = await waitForProcessExit(verifyPid, identityToken, 5000);
+        expect(terminated).toBe(true);
+        expect(getProcessIdentityStatus(verifyPid, identityToken)).toBe("exited");
 
         // 验证无 execution_results 持久化
         const persisted = await root.store.unitOfWork.run((tx) =>
@@ -1331,26 +1349,56 @@ describe("P1-R02-E：HTTP API 取消与异常状态迁移", () => {
 // ---------------------------------------------------------------------------
 
 /**
- * 检查指定 PID 的进程是否仍在运行。
- *
- * Windows 用 `tasklist /FI "PID eq <pid>" /NH`，输出包含 "No tasks" 表示
- * 进程已退出。非 Windows 用 `kill -0 <pid>`。
+ * 检查 PID 仍然对应本测试启动的验证进程，而不是仅凭 PID 判断存活。
  */
-function isProcessRunning(pid: string): boolean {
+function getProcessIdentityStatus(
+  pid: string,
+  identityToken: string
+): "running" | "exited" | "unknown" {
+  const numericPid = Number(pid);
+  if (!Number.isSafeInteger(numericPid) || numericPid <= 0) {
+    return "unknown";
+  }
   try {
     if (process.platform === "win32") {
-      const output = execSync(
-        `tasklist /FI "PID eq ${pid}" /NH /FO CSV`,
-        { encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "ignore"] }
+      const command = [
+        `$process = Get-CimInstance Win32_Process -Filter 'ProcessId = ${numericPid}'`,
+        "if ($null -ne $process) { $process.CommandLine }"
+      ].join("; ");
+      const output = execFileSync(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", command],
+        { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }
       );
-      // tasklist 在找不到进程时输出 "信息: 没有运行的任务匹配指定标准。"
-      // 或英文 "INFO: No tasks are running which match the specified criteria."
-      // 有结果时输出 CSV 格式行（含 PID）。
-      return output.includes(pid) && !output.includes("No tasks") && !output.includes("没有运行");
+      if (output.trim().length === 0) return "exited";
+      return output.includes(identityToken) ? "running" : "exited";
     }
-    process.kill(Number(pid), 0);
-    return true;
+    try {
+      const commandLine = readFileSync(`/proc/${numericPid}/cmdline`, "utf8");
+      return commandLine.includes(identityToken) ? "running" : "exited";
+    } catch {
+      const commandLine = execFileSync(
+        "ps",
+        ["-p", String(numericPid), "-o", "command="],
+        { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }
+      );
+      if (commandLine.trim().length === 0) return "exited";
+      return commandLine.includes(identityToken) ? "running" : "exited";
+    }
   } catch {
-    return false;
+    return "unknown";
   }
+}
+
+async function waitForProcessExit(
+  pid: string,
+  identityToken: string,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (getProcessIdentityStatus(pid, identityToken) === "exited") return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return getProcessIdentityStatus(pid, identityToken) === "exited";
 }

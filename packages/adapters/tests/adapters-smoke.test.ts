@@ -39,8 +39,17 @@ function sampleRepair(overrides: Partial<RepairRecord> = {}): RepairRecord {
     status: "APPROVED",
     symptom: "pytest test_users 返回 400",
     rootCause: "缺少 return 语句",
+    rootCauseConfidence: 0.9,
+    rootCauseEvidenceIds: ["evidence-smoke"],
     fixSummary: "补上 return response",
     applicabilityConditions: ["pytest", "fastapi"],
+    applicabilityConditionEvidence: [
+      {
+        text: "pytest 与 fastapi 场景",
+        evidenceIds: ["evidence-smoke"],
+        required: true
+      }
+    ],
     failureReasons: [],
     inputEvidencePackId: "pack-1",
     inputEvidencePackVersion: 1,
@@ -58,6 +67,21 @@ function sampleTaskInput() {
     riskLevel: "low" as const,
     rawSource: "",
     origin: "failed_test_log" as const
+  };
+}
+
+function sampleEvidencePack(taskId = "t1") {
+  return {
+    id: "pack-1",
+    taskId,
+    version: 1,
+    taskSnapshot: sampleTaskInput(),
+    evidence: [],
+    hypotheses: [],
+    constraints: [],
+    acceptanceCriteria: ["c1"],
+    createdAt: "2026-08-03T00:00:00.000Z",
+    contentHash: "fnv1a32-test"
   };
 }
 
@@ -109,6 +133,7 @@ describe("Fake 适配器 —— Phase 1 冒烟", () => {
         worktreePath: "/fake/wt",
         evidencePackId: "pack-1",
         evidencePackVersion: 1,
+        evidencePack: sampleEvidencePack(),
         taskInput: { ...sampleTaskInput(), acceptanceCriteria: ["c1"] },
         diff: {
           worktreePath: "/fake/wt",
@@ -247,6 +272,7 @@ describe("LocalCommandAdapter（ADR-001 MVP 兜底）", () => {
       worktreePath: "/fake/wt",
       evidencePackId: "pack-1",
       evidencePackVersion: 1,
+      evidencePack: sampleEvidencePack(),
       taskInput: { ...sampleTaskInput(), acceptanceCriteria: ["c1"] },
       diff: {
         worktreePath: "/fake/wt",
@@ -467,6 +493,7 @@ describe("P2-03 LocalProcessRunner 超时终止子进程", () => {
       // Windows taskkill /T /F 退出码可能是 1 或其他；POSIX SIGKILL 通常是 137 或 null→124
       // 关键断言：进程确实结束了（Promise resolve 了），且 timedOut=true
       expect(result.exitCode).not.toBe(0);
+      expect(result.termination).toMatchObject({ requested: true, completed: true });
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -506,6 +533,7 @@ describe("P1-05：LocalProcessRunner 支持 AbortSignal 取消进程树", () => 
       expect(result.exitCode).not.toBe(0);
       // 不是超时导致的终止
       expect(result.timedOut).toBe(false);
+      expect(result.termination).toMatchObject({ requested: true, completed: true });
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -533,6 +561,7 @@ describe("P1-05：LocalProcessRunner 支持 AbortSignal 取消进程树", () => 
       );
       expect(result.exitCode).not.toBe(0);
       expect(result.timedOut).toBe(false);
+      expect(result.termination).toMatchObject({ requested: true, completed: true });
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -768,6 +797,7 @@ describe("OmpAdapter（ADR-007 真实实现，不依赖 LLM API key）", () => {
         worktreePath: "/fake/wt",
         evidencePackId: "pack-1",
         evidencePackVersion: 1,
+        evidencePack: sampleEvidencePack(),
         taskInput: { ...sampleTaskInput(), acceptanceCriteria: ["c1"] },
         diff: {
           worktreePath: "/fake/wt",

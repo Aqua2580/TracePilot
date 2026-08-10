@@ -59,7 +59,9 @@ import type {
   PathPolicy,
   ProjectCommands,
   ControlledFileWriter,
-  FileChangeInstruction
+  FileChangeInstruction,
+  Hypothesis,
+  EvidenceConstraint
 } from "@tracepilot/core";
 import { PolicyDeniedError } from "./local-command-adapter.js";
 
@@ -442,7 +444,18 @@ export class OmpAdapter implements RuntimeAdapter {
           `omp review 退出码 ${result.exitCode}：${truncateStderr(result.stderr)}`
         );
       }
-      const parsed = extractReviewResult(result.stdout, input);
+      if (result.truncated) {
+        return truncatedReviewResult(input, result);
+      }
+      // Review 使用 text 模式：Omp 只返回最终 assistant 文本，必须严格按
+      // 一个 ReviewResult JSON 解析，不再把事件流头部当作候选结果。
+      const parsed = parseReviewResultText(result.stdout, input, undefined, {
+        truncated: result.truncated,
+        originalBytes: result.originalBytes,
+        retainedBytes: result.retainedBytes,
+        outputMode: "text",
+        textSegmentCount: result.stdout.trim().length > 0 ? 1 : 0
+      });
       return parsed;
     } finally {
       // §7.4 第 1 点：清理 runs 记录。
@@ -469,7 +482,7 @@ export class OmpAdapter implements RuntimeAdapter {
   /**
    * 组装 omp argv。结构固定：
    *
-   *   <ompPath> -p --mode json --cwd <worktree> --no-session
+   *   <ompPath> -p --mode json|text --cwd <worktree> --no-session
    *              --max-time <seconds> --tools <phase-specific-tools>
    *              --approval-mode=write [--profile <name>] [--model <name>]
    *              [--add-dir <path>...] "<prompt>"
@@ -498,7 +511,7 @@ export class OmpAdapter implements RuntimeAdapter {
     const argv: string[] = [
       this.opts.ompPath,
       "-p",
-      "--mode", "json",
+      "--mode", phase === "review" ? "text" : "json",
       "--cwd", worktreePath,
       "--no-session",
       "--max-time", Math.max(1, Math.floor(timeoutMs / 1000)).toString()
@@ -556,7 +569,8 @@ export class OmpAdapter implements RuntimeAdapter {
    * 步骤：
    * 1. `validateOmpArgv`：等价 omp 专用 CommandPolicy，校验 argv 结构。
    *    - argv[0] 必须与 opts.ompPath 严格相等（防 PATH 注入）
-   *    - 必须包含 -p / --mode json / --approval-mode=write / --no-session
+   *    - analyze/develop 必须使用 --mode json；review 使用 --mode text
+   *      只接收最终 assistant 文本；三者都必须包含 --approval-mode=write / --no-session
    *    - --cwd 值必须经 PathPolicy 校验位于 allowedWorktreeRoots 内
    *    - --add-dir 每个值也必须经 PathPolicy 校验
    *    - --max-time 必须在 [1, processPolicy.timeoutMs/1000] 范围内
@@ -594,7 +608,7 @@ export class OmpAdapter implements RuntimeAdapter {
    * omp argv 结构校验（等价 CommandPolicy.decide，但针对 omp 特化）。
    *
    * 校验规则按 ADR-007 §决策 2 的固定 CLI 拓扑：
-   *   <ompPath> -p --mode json --cwd <path> --approval-mode=write --no-session
+   *   <ompPath> -p --mode json|text --cwd <path> --approval-mode=write --no-session
    *             --no-extensions --no-skills --no-rules
    *             --max-time <sec> [--profile <name>] [--model <name>]
    *             [--add-dir <path>...] "<prompt>"
@@ -627,12 +641,15 @@ export class OmpAdapter implements RuntimeAdapter {
         `argv[1] 必须是 -p 或 --print，实际 ${argv[1]}`
       );
     }
-    // --mode json
+    // analyze/develop 使用 JSON 事件流；review 使用 text 模式，避免完整事件流
+    // 超过上限后只保留头部而丢失末尾 assistant ReviewResult。
     const modeIdx = argv.indexOf("--mode");
-    if (modeIdx === -1 || argv[modeIdx + 1] !== "json") {
+    const mode = modeIdx === -1 ? undefined : argv[modeIdx + 1];
+    const isReviewTextMode = mode === "text" && argv.includes("--no-tools");
+    if (modeIdx === -1 || (mode !== "json" && !isReviewTextMode)) {
       throw new OmpArgvValidationError(
-        "missing-mode-json",
-        "argv 必须包含 --mode json"
+        "invalid-mode",
+        "analyze/develop 必须使用 --mode json；review 必须使用 --mode text 且包含 --no-tools"
       );
     }
     // --cwd <path>，且 path 必须经 PathPolicy 校验
@@ -959,6 +976,12 @@ export class OmpAdapter implements RuntimeAdapter {
       `## 任务 ID: ${input.taskId}`,
       `## Evidence Pack: ${input.evidencePackId}@v${input.evidencePackVersion}`,
       "",
+      "## Evidence Pack 内容（不可变来源快照）",
+      "Reviewer 必须只使用以下已冻结来源；不得把未出现在 Pack 中的临时搜索或 Developer 推理当作正式证据。",
+      "```json",
+      JSON.stringify(input.evidencePack, null, 2),
+      "```",
+      "",
       "## 任务原始目标",
       ti.objective,
       "",
@@ -982,32 +1005,21 @@ export class OmpAdapter implements RuntimeAdapter {
       "```",
       "",
       "## 输出要求",
-      "只输出一个 JSON 对象，不得包含任何额外文本。schema：",
-      "```json",
-      JSON.stringify(
-        {
-          verdict: "ship | ship_with_fixes | block",
-          findings: [
-            {
-              priority: "P0 | P1 | P2 | P3",
-              confidence: "0.0-1.0",
-              message: "问题描述",
-              locator: "文件:行号（可选）"
-            }
-          ],
-          summary: "评审摘要"
-        },
-        null,
-        2
-      ),
-      "```",
+      "只输出一个 JSON 对象，不得包含任何额外文本。下面是只包含 JSON 对象内容的 schema 示例，不要复制任何包装：",
+      buildReviewResultOutputExample(),
+      "confidence 字段必须是不加引号的 JSON number，取值范围为 [0,1]；required 必须是 JSON boolean true 或 false。",
+      "verdict、priority、category 必须分别使用各自枚举中的一个合法值，不得输出枚举说明文本。",
+      "去除首尾空白后，首字符必须是 `{`，末字符必须是 `}`；不要输出 Markdown JSON 围栏或其他额外文本。",
       "",
       "## 评审要点",
       "1. diff 是否仅触碰 allowedPaths 白名单内的文件；",
       "2. 是否满足全部验收标准；",
       "3. 是否引入 P0/P1 风险（数据损坏、安全漏洞、回归）；",
-      "4. 验证结果是否真实通过；",
-      "5. verdict=block 仅当存在 P0/P1 问题；ship_with_fixes 当存在 P2/P3 但可发布；ship 当无任何问题。",
+      "4. 是否存在兼容性问题或缺少回归测试；这两类 finding 必须分别标记 category=compatibility 或 category=regression_test；category 缺失或不在枚举内时必须返回 block；",
+      "5. 验证结果是否真实通过；",
+      "6. verdict=ship/ship_with_fixes 时 rootCause 必须精确复制当前 Pack 中一个 hypothesis（text、confidence、evidenceIds 均一致）；不得根据临时搜索新造根因。Pack 没有合适 hypothesis 时必须 verdict=block 并说明需要 Evidence Request；",
+      "7. applicabilityConditions 如提供，只能精确复制当前 Pack 中已有 constraint，并保留 evidenceIds 与 required；",
+      "8. verdict=block 用于任何不能安全批准的结果；ship_with_fixes 只能用于没有阻断性 finding 的 P2/P3 建议；ship 用于没有问题的结果。",
       ""
     ];
     return lines.join("\n");
@@ -1017,6 +1029,44 @@ export class OmpAdapter implements RuntimeAdapter {
 // --------------------------------------------------------------------------
 // 模块级辅助：NDJSON 解析、ReviewResult 提取、格式化
 // --------------------------------------------------------------------------
+
+/**
+ * 返回嵌入 Review prompt 的合法 ReviewResult 示例。
+ * 示例中的枚举只取一个合法值，数值和布尔值保持真实 JSON 类型，避免
+ * 模型把类型说明文字误当成提交结果。
+ */
+export function buildReviewResultOutputExample(): string {
+  return JSON.stringify(
+    {
+      verdict: "ship_with_fixes",
+      findings: [
+        {
+          priority: "P2",
+          confidence: 0.95,
+          category: "correctness",
+          message: "问题描述",
+          locator: "src/example.ts:10"
+        }
+      ],
+      rootCause: {
+        text: "复制当前 Pack 中某个 hypotheses[].text",
+        confidence: 0.95,
+        evidenceIds: ["复制当前 Pack 中的 Evidence ID"]
+      },
+      fixSummary: "修复摘要",
+      applicabilityConditions: [
+        {
+          text: "复制当前 Pack 中某个 constraints[].text",
+          evidenceIds: ["复制当前 Pack 中的 Evidence ID"],
+          required: true
+        }
+      ],
+      summary: "评审摘要"
+    },
+    null,
+    2
+  );
+}
 
 /**
  * 解析 omp --mode json 的 NDJSON 输出为 RuntimeEvent 序列。
@@ -1217,90 +1267,430 @@ function mapOmpObjectToRuntimeEvent(
 /**
  * 从 omp review 的 stdout 中提取 ReviewResult JSON。
  *
- * 容错策略：
- * 1. 优先尝试整段 stdout 作为 JSON 解析；
- * 2. 失败则扫描第一个 `{...}` 平衡花括号子串；
- * 3. 仍失败则回退到基于启发式的默认 ReviewResult（block + P1 finding）。
+ * 生产 Review 使用 text 模式并直接接收最终 assistant 文本；本函数兼容历史
+ * NDJSON 夹具与调用方的 assistant 文本提取。两条路径都只接受裸 JSON 或恰好
+ * 一层完整 Markdown JSON 围栏，不从说明文字中扫描或拼接对象。
  *
  * 字段校验：verdict 必须是 ship/ship_with_fixes/block；findings 数组每项
- * 必须有 priority（P0-P3）和 message；缺字段时降级或填充默认值。
+ * 必须有 priority、confidence、category 和非空 message。任何字段缺失或
+ * 枚举非法都返回 block + P1 finding，禁止失败开放。
  */
 export function extractReviewResult(
   stdout: string,
   input: ReviewTaskInput
 ): ReviewResult {
-  // 1. 尝试整段解析
-  let candidate: unknown = null;
-  try {
-    candidate = JSON.parse(stdout);
-  } catch {
-    // 2. 扫描第一个平衡花括号子串
-    const start = stdout.indexOf("{");
-    if (start !== -1) {
-      const sub = extractBalancedJson(stdout, start);
-      if (sub) {
-        try {
-          candidate = JSON.parse(sub);
-        } catch {
-          candidate = null;
-        }
+  const assistantText = extractAssistantTextFromOmpNdjson(stdout);
+  const textModeMetrics = {
+    outputMode: "text" as const,
+    textSegmentCount: stdout.trim().length > 0 ? 1 : 0
+  };
+  if (assistantText.text !== null) {
+    if (assistantText.reason) {
+      return parseReviewResultText("", input, assistantText.reason, {
+        outputMode: "ndjson",
+        textSegmentCount: assistantText.textSegmentCount
+      });
+    }
+    return parseReviewResultText(assistantText.text, input, undefined, {
+      outputMode: "ndjson",
+      textSegmentCount: assistantText.textSegmentCount
+    });
+  }
+
+  if (assistantText.sawOmpEvent) {
+    return parseReviewResultText("", input, assistantText.reason, {
+      outputMode: "ndjson",
+      textSegmentCount: assistantText.textSegmentCount
+    });
+  }
+
+  // text 模式和本地 stub 都必须提供完整 JSON；不会从任意说明文字中抽取对象。
+  return parseReviewResultText(stdout, input, assistantText.reason, textModeMetrics);
+}
+
+/**
+ * 从 Omp `--mode json` 的 NDJSON 中提取 assistant 最终文本。
+ *
+ * 只读取 `message_end.message.content[]` 中 `role=assistant` 且
+ * `type=text` 的内容，并按消息和内容块出现顺序拼接。thinking、tool、
+ * session、turn_end 以及其他角色的消息都不会进入结果。
+ *
+ * 返回 null 表示没有可用于 Review 的 terminal assistant 文本，调用方必须
+ * 失败关闭；该函数不执行任何文件、进程或网络操作。
+ */
+export function extractAssistantTextFromOmpNdjson(
+  stdout: string
+): {
+  readonly text: string | null;
+  readonly reason: string;
+  readonly sawOmpEvent: boolean;
+  /** NDJSON 中实际收集到的 assistant text 内容段数量。 */
+  readonly textSegmentCount: number;
+} {
+  const assistantTexts: string[] = [];
+  let sawAssistantMessage = false;
+  let sawInvalidNdjsonLine = false;
+  let sawOmpEvent = false;
+
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    let obj: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        sawInvalidNdjsonLine = true;
+        continue;
+      }
+      obj = parsed as Record<string, unknown>;
+    } catch {
+      // develop 允许忽略 Omp 附带的非结构化日志；Review 会在下方看到
+      // reason 后失败关闭，不会把不完整流当成合法 Review。
+      sawInvalidNdjsonLine = true;
+      continue;
+    }
+
+    if (typeof obj.type === "string") sawOmpEvent = true;
+    if (obj.type !== "message_end") continue;
+    const message = obj.message as Record<string, unknown> | undefined;
+    if (!message || message.role !== "assistant") continue;
+
+    sawAssistantMessage = true;
+    const content = message.content;
+    if (!Array.isArray(content)) continue;
+
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      const block = part as Record<string, unknown>;
+      if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) {
+        assistantTexts.push(block.text);
       }
     }
   }
 
-  if (candidate && typeof candidate === "object") {
-    const obj = candidate as Record<string, unknown>;
-    const verdict = normalizeVerdict(obj.verdict);
-    const findings = normalizeFindings(obj.findings);
-    const summary = typeof obj.summary === "string" ? obj.summary : `omp review: ${verdict}`;
-    return { verdict, findings, summary };
+  const text = assistantTexts.join("");
+  if (text.length > 0) {
+    return {
+      text,
+      reason: sawInvalidNdjsonLine ? "Omp NDJSON 包含无法解析的行" : "",
+      sawOmpEvent,
+      textSegmentCount: assistantTexts.length
+    };
   }
 
-  // 3. 回退：无法解析时返回 block + P1 finding，提示人工复核
+  return {
+    text: null,
+    reason: sawAssistantMessage
+      ? "terminal assistant message 缺少非空 text 内容"
+      : "未找到 terminal assistant message",
+    sawOmpEvent,
+    textSegmentCount: assistantTexts.length
+  };
+}
+
+interface ReviewOutputMetrics {
+  readonly truncated?: boolean;
+  readonly originalBytes?: number;
+  readonly retainedBytes?: number;
+  /** text 表示最终 stdout 段；ndjson 表示 assistant content 段。 */
+  readonly outputMode?: "text" | "ndjson";
+  readonly textSegmentCount?: number;
+}
+
+interface ReviewTextDiagnostics extends ReviewOutputMetrics {
+  readonly stdoutBytes: number;
+  readonly markdownFenceStart: boolean;
+  readonly markdownFenceEnd: boolean;
+  readonly normalizationForm:
+    | "bare"
+    | "paired_fence"
+    | "opening_fence_only"
+    | "closing_fence_only"
+    | "invalid_fence";
+  readonly closingFenceOnLastLine: boolean;
+  readonly objectStartsWithBrace: boolean;
+  readonly objectEndsWithBrace: boolean;
+  readonly internalFence: boolean;
+  readonly normalizationError?: "markdown_fence_invalid";
+  readonly jsonErrorCategory?:
+    | "non_json_text"
+    | "incomplete_json"
+    | "trailing_content"
+    | "invalid_json"
+    | "json_non_object"
+    | "markdown_fence_invalid";
+  readonly jsonErrorPosition?: number;
+}
+
+interface NormalizedReviewText {
+  readonly text: string;
+  readonly markdownFenceStart: boolean;
+  readonly markdownFenceEnd: boolean;
+  readonly normalizationForm: ReviewTextDiagnostics["normalizationForm"];
+  readonly closingFenceOnLastLine: boolean;
+  readonly objectStartsWithBrace: boolean;
+  readonly objectEndsWithBrace: boolean;
+  readonly internalFence: boolean;
+  readonly normalizationError?: "markdown_fence_invalid";
+}
+
+function normalizeReviewText(text: string): NormalizedReviewText {
+  const trimmed = text.trim();
+  const markdownFenceStart = trimmed.startsWith("```");
+  const markdownFenceEnd = trimmed.endsWith("```");
+  const openingMatch = /^```(?:json)?[ \t]*\r?\n/i.exec(trimmed);
+  const closingMatch = /\r?\n```$/.exec(trimmed);
+  const closingFenceOnLastLine = closingMatch !== null;
+  const closingIndex = closingMatch?.index;
+  const shapeStart = openingMatch?.[0].length ?? 0;
+  const shapeEnd = closingIndex ?? trimmed.length;
+  const shapeText = shapeEnd >= shapeStart
+    ? trimmed.slice(shapeStart, shapeEnd).trim()
+    : "";
+  const fenceMarkerCount = countMarkdownFenceMarkers(trimmed);
+  const boundaryFenceCount = Number(markdownFenceStart) + Number(markdownFenceEnd);
+  const metadata = {
+    markdownFenceStart,
+    markdownFenceEnd,
+    closingFenceOnLastLine,
+    objectStartsWithBrace: shapeText.startsWith("{"),
+    objectEndsWithBrace: shapeText.endsWith("}"),
+    internalFence: fenceMarkerCount > boundaryFenceCount
+  };
+
+  const invalidFence = (): NormalizedReviewText => ({
+    text: trimmed,
+    ...metadata,
+    normalizationForm: "invalid_fence",
+    normalizationError: "markdown_fence_invalid"
+  });
+
+  if (!markdownFenceStart && !markdownFenceEnd) {
+    if (trimmed.includes("```")) return invalidFence();
+    return {
+      text: trimmed,
+      ...metadata,
+      normalizationForm: "bare"
+    };
+  }
+
+  if (markdownFenceStart && markdownFenceEnd) {
+    const match = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(trimmed);
+    const inner = match?.[1];
+    if (inner === undefined || inner.includes("```")) return invalidFence();
+    return {
+      text: inner.trim(),
+      ...metadata,
+      normalizationForm: "paired_fence"
+    };
+  }
+
+  if (markdownFenceStart) {
+    const inner = openingMatch
+      ? trimmed.slice(openingMatch[0].length).trim()
+      : "";
+    if (!openingMatch || inner.includes("```") || !inner.endsWith("}")) {
+      return invalidFence();
+    }
+    return {
+      text: inner,
+      ...metadata,
+      normalizationForm: "opening_fence_only"
+    };
+  }
+
+  const body = closingIndex === undefined ? "" : trimmed.slice(0, closingIndex).trimEnd();
+  if (
+    closingIndex === undefined ||
+    !body.startsWith("{") ||
+    !body.endsWith("}") ||
+    body.includes("```")
+  ) {
+    return invalidFence();
+  }
+  return {
+    text: body,
+    ...metadata,
+    normalizationForm: "closing_fence_only"
+  };
+}
+
+function countMarkdownFenceMarkers(text: string): number {
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const index = text.indexOf("```", offset);
+    if (index < 0) return count;
+    count += 1;
+    offset = index + 3;
+  }
+}
+
+function classifyReviewJsonError(
+  error: unknown,
+  text: string,
+  normalizationError?: "markdown_fence_invalid"
+): { category: ReviewTextDiagnostics["jsonErrorCategory"]; position?: number } {
+  if (normalizationError) return { category: normalizationError };
+  const message = error instanceof SyntaxError ? error.message : "";
+  const positionMatch = /(?:at position|position)\s+(\d+)/i.exec(message);
+  const position = positionMatch ? Number(positionMatch[1]) : undefined;
+  if (/unexpected end/i.test(message)) {
+    return { category: "incomplete_json", ...(position !== undefined ? { position } : {}) };
+  }
+  if (/non-whitespace character after JSON/i.test(message)) {
+    return { category: "trailing_content", ...(position !== undefined ? { position } : {}) };
+  }
+  const firstCharacter = text.trim().charAt(0);
+  if (firstCharacter !== "{" && firstCharacter !== "[") {
+    return { category: "non_json_text", ...(position !== undefined ? { position } : {}) };
+  }
+  return { category: "invalid_json", ...(position !== undefined ? { position } : {}) };
+}
+
+function formatReviewTextDiagnostics(diagnostics: ReviewTextDiagnostics): string {
+  return JSON.stringify({
+    stdoutBytes: diagnostics.stdoutBytes,
+    markdownFenceStart: diagnostics.markdownFenceStart,
+    markdownFenceEnd: diagnostics.markdownFenceEnd,
+    normalizationForm: diagnostics.normalizationForm,
+    closingFenceOnLastLine: diagnostics.closingFenceOnLastLine,
+    objectStartsWithBrace: diagnostics.objectStartsWithBrace,
+    objectEndsWithBrace: diagnostics.objectEndsWithBrace,
+    internalFence: diagnostics.internalFence,
+    ...(diagnostics.outputMode !== undefined
+      ? { outputMode: diagnostics.outputMode }
+      : {}),
+    ...(diagnostics.textSegmentCount !== undefined
+      ? { textSegmentCount: diagnostics.textSegmentCount }
+      : {}),
+    ...(diagnostics.normalizationError
+      ? { normalizationError: diagnostics.normalizationError }
+      : {}),
+    ...(diagnostics.jsonErrorCategory
+      ? { jsonErrorCategory: diagnostics.jsonErrorCategory }
+      : {}),
+    ...(diagnostics.jsonErrorPosition !== undefined
+      ? { jsonErrorPosition: diagnostics.jsonErrorPosition }
+      : {}),
+    ...(diagnostics.truncated !== undefined ? { truncated: diagnostics.truncated } : {}),
+    ...(diagnostics.originalBytes !== undefined
+      ? { originalBytes: diagnostics.originalBytes }
+      : {}),
+    ...(diagnostics.retainedBytes !== undefined
+      ? { retainedBytes: diagnostics.retainedBytes }
+      : {})
+  });
+}
+
+function parseReviewResultText(
+  text: string,
+  input: ReviewTaskInput,
+  extractionReason?: string,
+  outputMetrics?: ReviewOutputMetrics
+): ReviewResult {
+  const normalized = normalizeReviewText(text);
+  let diagnostics: ReviewTextDiagnostics = {
+    stdoutBytes: Buffer.byteLength(text, "utf8"),
+    markdownFenceStart: normalized.markdownFenceStart,
+    markdownFenceEnd: normalized.markdownFenceEnd,
+    normalizationForm: normalized.normalizationForm,
+    closingFenceOnLastLine: normalized.closingFenceOnLastLine,
+    objectStartsWithBrace: normalized.objectStartsWithBrace,
+    objectEndsWithBrace: normalized.objectEndsWithBrace,
+    internalFence: normalized.internalFence,
+    ...(normalized.normalizationError
+      ? { normalizationError: normalized.normalizationError }
+      : {}),
+    ...(outputMetrics ?? {})
+  };
+
+  // 只对裸 JSON、完整成对围栏或严格单边围栏归一化后的全文解析。
+  let candidate: unknown = null;
+  if (normalized.normalizationError) {
+    // 归一化器已经确认存在未受控围栏；即使原文碰巧是合法 JSON，也不得
+    // 继续进入 schema 成功路径，否则 invalid_fence 的安全边界会失效。
+    diagnostics = {
+      ...diagnostics,
+      jsonErrorCategory: "markdown_fence_invalid"
+    };
+  } else {
+    try {
+      candidate = JSON.parse(normalized.text);
+    } catch (error) {
+      const parseError = classifyReviewJsonError(error, normalized.text, normalized.normalizationError);
+      diagnostics = {
+        ...diagnostics,
+        jsonErrorCategory: parseError.category,
+        ...(parseError.position !== undefined ? { jsonErrorPosition: parseError.position } : {})
+      };
+    }
+  }
+
+  if (candidate !== null && (typeof candidate !== "object" || Array.isArray(candidate))) {
+    diagnostics = { ...diagnostics, jsonErrorCategory: "json_non_object" };
+  }
+
+  if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+    const obj = candidate as Record<string, unknown>;
+    const verdict = normalizeVerdict(obj.verdict);
+    if (!isReviewVerdict(obj.verdict)) {
+      return invalidReviewSchema(input, "verdict 缺失或非法", formatReviewTextDiagnostics(diagnostics));
+    }
+    const findings = normalizeFindings(obj.findings);
+    if (findings.error) {
+      return invalidReviewSchema(input, findings.error, formatReviewTextDiagnostics(diagnostics));
+    }
+    const summary = typeof obj.summary === "string" ? obj.summary.trim() : "";
+    if (summary.length === 0) {
+      return invalidReviewSchema(input, "summary 必须是非空字符串", formatReviewTextDiagnostics(diagnostics));
+    }
+    const rootCause = normalizeHypothesis(obj.rootCause);
+    if (verdict !== "block" && rootCause.error) {
+      return invalidReviewSchema(input, rootCause.error, formatReviewTextDiagnostics(diagnostics));
+    }
+    if (obj.rootCause !== undefined && rootCause.error) {
+      return invalidReviewSchema(input, rootCause.error, formatReviewTextDiagnostics(diagnostics));
+    }
+    const fixSummary = typeof obj.fixSummary === "string" && obj.fixSummary.trim().length > 0
+      ? obj.fixSummary.trim()
+      : undefined;
+    if (obj.fixSummary !== undefined && fixSummary === undefined) {
+      return invalidReviewSchema(input, "fixSummary 必须是非空字符串", formatReviewTextDiagnostics(diagnostics));
+    }
+    const applicabilityConditions = normalizeEvidenceConstraints(obj.applicabilityConditions);
+    if (applicabilityConditions.error) {
+      return invalidReviewSchema(input, applicabilityConditions.error, formatReviewTextDiagnostics(diagnostics));
+    }
+    return {
+      verdict,
+      findings: findings.items,
+      summary,
+      ...(rootCause.item !== undefined ? { rootCause: rootCause.item } : {}),
+      ...(fixSummary !== undefined ? { fixSummary } : {}),
+      ...(applicabilityConditions.items !== undefined
+        ? { applicabilityConditions: applicabilityConditions.items }
+        : {})
+    };
+  }
+
+  // 回退：无法解析时返回 block + P1 finding，提示人工复核。
+  // 不把 stdout 原文放入响应，避免 prompt、凭据或业务内容泄漏。
+  const reason = extractionReason || "assistant 文本不是完整 ReviewResult JSON";
+  const diagnosticText = formatReviewTextDiagnostics(diagnostics);
   return {
     verdict: "block",
     findings: [
       {
         priority: "P1",
         confidence: 0.5,
-        message: `omp review 输出无法解析为 ReviewResult JSON，已回退到 block。stdout 前 200 字符：${stdout.slice(0, 200)}`
+        category: "other",
+        message: `omp review 输出无法解析为 ReviewResult JSON，已回退到 block。原因：${reason}；诊断：${diagnosticText}`
       }
     ],
-    summary: `OmpAdapter review 回退（任务 ${input.taskId}）：JSON 解析失败`
+    summary: `OmpAdapter review 回退（任务 ${input.taskId}）：${reason}；诊断：${diagnosticText}`
   };
-}
-
-/** 提取从 `start` 开始的第一个平衡花括号子串。 */
-function extractBalancedJson(s: string, start: number): string | null {
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i];
-    if (!ch) continue;
-    if (inString) {
-      if (escape) {
-        escape = false;
-      } else if (ch === "\\") {
-        escape = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === "{") depth++;
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0) {
-        return s.slice(start, i + 1);
-      }
-    }
-  }
-  return null;
 }
 
 function normalizeVerdict(v: unknown): ReviewResult["verdict"] {
@@ -1308,25 +1698,204 @@ function normalizeVerdict(v: unknown): ReviewResult["verdict"] {
   return "block"; // 未知值保守视为 block
 }
 
-function normalizeFindings(f: unknown): ReviewFinding[] {
-  if (!Array.isArray(f)) return [];
+function isReviewVerdict(v: unknown): v is ReviewResult["verdict"] {
+  return v === "ship" || v === "ship_with_fixes" || v === "block";
+}
+
+function invalidReviewSchema(
+  input: ReviewTaskInput,
+  reason: string,
+  diagnostics?: string
+): ReviewResult {
+  const diagnosticSuffix = diagnostics ? `；诊断：${diagnostics}` : "";
+  return {
+    verdict: "block",
+    findings: [
+      {
+        priority: "P1",
+        confidence: 1,
+        category: "other",
+        message: `omp review 输出不符合严格 Review schema：${reason}${diagnosticSuffix}`
+      }
+    ],
+    summary: `OmpAdapter review 失败关闭（任务 ${input.taskId}）：${reason}${diagnosticSuffix}`
+  };
+}
+
+function truncatedReviewResult(
+  input: ReviewTaskInput,
+  result: CommandResult
+): ReviewResult {
+  const normalized = normalizeReviewText(result.stdout);
+  const reason = [
+    `truncated=${result.truncated}`,
+    `originalBytes=${result.originalBytes}`,
+    `retainedBytes=${result.retainedBytes}`,
+    `stdoutBytes=${Buffer.byteLength(result.stdout, "utf8")}`,
+    `markdownFenceStart=${normalized.markdownFenceStart}`,
+    `markdownFenceEnd=${normalized.markdownFenceEnd}`,
+    `normalizationForm=${normalized.normalizationForm}`,
+    `closingFenceOnLastLine=${normalized.closingFenceOnLastLine}`,
+    `objectStartsWithBrace=${normalized.objectStartsWithBrace}`,
+    `objectEndsWithBrace=${normalized.objectEndsWithBrace}`,
+    `internalFence=${normalized.internalFence}`,
+    "outputMode=text",
+    `textSegmentCount=${result.stdout.trim().length > 0 ? 1 : 0}`
+  ].join(", ");
+  return {
+    verdict: "block",
+    findings: [
+      {
+        priority: "P1",
+        confidence: 1,
+        category: "other",
+        message: `omp review 输出被截断，已失败关闭：${reason}`
+      }
+    ],
+    summary: `OmpAdapter review 失败关闭（任务 ${input.taskId}）：输出截断（${reason}）`
+  };
+}
+
+function normalizeHypothesis(
+  value: unknown
+): { item?: Hypothesis; error?: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { error: "rootCause 必须是包含 text、confidence、evidenceIds 的对象" };
+  }
+  const obj = value as Record<string, unknown>;
+  const text = typeof obj.text === "string" ? obj.text.trim() : "";
+  if (text.length === 0) return { error: "rootCause.text 不能为空" };
+  if (
+    typeof obj.confidence !== "number" ||
+    !Number.isFinite(obj.confidence) ||
+    obj.confidence < 0 ||
+    obj.confidence > 1
+  ) {
+    return { error: "rootCause.confidence 必须是 0 到 1 之间的数字" };
+  }
+  const evidenceIds = normalizeEvidenceIds(obj.evidenceIds, "rootCause.evidenceIds");
+  if (evidenceIds.error) return { error: evidenceIds.error };
+  return {
+    item: {
+      text,
+      confidence: obj.confidence,
+      evidenceIds: evidenceIds.items ?? []
+    }
+  };
+}
+
+function normalizeEvidenceConstraints(
+  value: unknown
+): { items?: readonly EvidenceConstraint[]; error?: string } {
+  if (value === undefined) return {};
+  if (!Array.isArray(value)) {
+    return { error: "applicabilityConditions 必须是数组" };
+  }
+  const items: EvidenceConstraint[] = [];
+  for (const [index, condition] of value.entries()) {
+    if (!condition || typeof condition !== "object" || Array.isArray(condition)) {
+      return { error: `applicabilityConditions[${index}] 必须是对象` };
+    }
+    const obj = condition as Record<string, unknown>;
+    const text = typeof obj.text === "string" ? obj.text.trim() : "";
+    if (text.length === 0) {
+      return { error: `applicabilityConditions[${index}].text 不能为空` };
+    }
+    if (typeof obj.required !== "boolean") {
+      return { error: `applicabilityConditions[${index}].required 必须是 boolean` };
+    }
+    const evidenceIds = normalizeEvidenceIds(
+      obj.evidenceIds,
+      `applicabilityConditions[${index}].evidenceIds`
+    );
+    if (evidenceIds.error) return { error: evidenceIds.error };
+    items.push({
+      text,
+      required: obj.required,
+      evidenceIds: evidenceIds.items ?? []
+    });
+  }
+  return { items };
+}
+
+function normalizeEvidenceIds(
+  value: unknown,
+  field: string
+): { items?: readonly string[]; error?: string } {
+  if (!Array.isArray(value) || value.length === 0) {
+    return { error: `${field} 必须是非空字符串数组` };
+  }
+  const items: string[] = [];
+  for (const id of value) {
+    if (typeof id !== "string" || id.trim().length === 0) {
+      return { error: `${field} 只能包含非空字符串` };
+    }
+    items.push(id.trim());
+  }
+  if (new Set(items).size !== items.length) {
+    return { error: `${field} 不得包含重复 ID` };
+  }
+  return { items };
+}
+
+function normalizeFindings(
+  f: unknown
+): { items: ReviewFinding[]; error?: string } {
+  if (!Array.isArray(f)) return { items: [], error: "findings 必须是数组" };
   const out: ReviewFinding[] = [];
-  for (const item of f) {
-    if (!item || typeof item !== "object") continue;
+  for (const [index, item] of f.entries()) {
+    if (!item || typeof item !== "object") {
+      return { items: [], error: `findings[${index}] 必须是对象` };
+    }
     const obj = item as Record<string, unknown>;
     const priority = obj.priority;
-    const message = typeof obj.message === "string" ? obj.message : "";
+    const message = typeof obj.message === "string" ? obj.message.trim() : "";
     if (
-      priority === "P0" || priority === "P1" || priority === "P2" || priority === "P3"
+      priority !== "P0" && priority !== "P1" && priority !== "P2" && priority !== "P3"
     ) {
-      const confidence = typeof obj.confidence === "number"
-        ? Math.max(0, Math.min(1, obj.confidence))
-        : 0.5;
-      const locator = typeof obj.locator === "string" ? obj.locator : undefined;
-      out.push({ priority, confidence, message, ...(locator !== undefined ? { locator } : {}) });
+      return { items: [], error: `findings[${index}].priority 非法` };
     }
+    if (message.length === 0) {
+      return { items: [], error: `findings[${index}].message 不能为空` };
+    }
+    if (
+      typeof obj.confidence !== "number" ||
+      !Number.isFinite(obj.confidence) ||
+      obj.confidence < 0 ||
+      obj.confidence > 1
+    ) {
+      return { items: [], error: `findings[${index}].confidence 必须是 0 到 1 之间的数字` };
+    }
+    const category = normalizeFindingCategory(obj.category);
+    if (category === undefined) {
+      return { items: [], error: `findings[${index}].category 缺失或非法` };
+    }
+    const locator = typeof obj.locator === "string" ? obj.locator : undefined;
+    out.push({
+      priority,
+      confidence: obj.confidence,
+      message,
+      ...(locator !== undefined ? { locator } : {}),
+      category
+    });
   }
-  return out;
+  return { items: out };
+}
+
+function normalizeFindingCategory(
+  category: unknown
+): "compatibility" | "regression_test" | "correctness" | "security" | "maintainability" | "other" | undefined {
+  if (
+    category === "compatibility" ||
+    category === "regression_test" ||
+    category === "correctness" ||
+    category === "security" ||
+    category === "maintainability" ||
+    category === "other"
+  ) {
+    return category;
+  }
+  return undefined;
 }
 
 function formatProjectCommands(commands: ProjectCommands): string[] {
@@ -1380,32 +1949,8 @@ function truncateStderr(stderr: string, max = 500): string {
  * @returns 文件修改指令列表（可能为空）
  */
 export function extractFileChangesFromStdout(stdout: string): FileChangeInstruction[] {
-  const assistantTexts: string[] = [];
-  const lines = stdout.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let obj: Record<string, unknown>;
-    try {
-      obj = JSON.parse(trimmed) as Record<string, unknown>;
-    } catch {
-      continue; // 非 JSON 行跳过（已在 parseOmpNdjsonEvents 中记 progress）
-    }
-    if (obj.type !== "message_end") continue;
-    const message = obj.message as Record<string, unknown> | undefined;
-    if (!message || message.role !== "assistant") continue;
-    const content = message.content;
-    if (!Array.isArray(content)) continue;
-    for (const part of content) {
-      if (!part || typeof part !== "object") continue;
-      const p = part as Record<string, unknown>;
-      if (p.type === "text" && typeof p.text === "string") {
-        assistantTexts.push(p.text);
-      }
-    }
-  }
-  const fullText = assistantTexts.join("");
-  return extractFileChangesFromText(fullText);
+  const assistantText = extractAssistantTextFromOmpNdjson(stdout);
+  return extractFileChangesFromText(assistantText.text ?? "");
 }
 
 /**

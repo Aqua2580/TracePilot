@@ -21,7 +21,13 @@ import {
   type EvidenceRequest,
   type EvidenceKind
 } from "@tracepilot/core";
-import type { RepairRecord, VerificationSummary, ReviewSummary, ReviewFinding } from "@tracepilot/core";
+import {
+  RepairMemoryWriteError,
+  type RepairRecord,
+  type VerificationSummary,
+  type ReviewSummary,
+  type ReviewFinding
+} from "@tracepilot/core";
 import type { AuditEvent, AuditEventType, OutputTruncation } from "@tracepilot/core";
 import type { AgentRunRecord } from "@tracepilot/core";
 import type { ExecutionResult } from "@tracepilot/core";
@@ -312,7 +318,7 @@ class SqliteEvidencePackRepository implements EvidencePackRepository {
   }
 }
 
-interface EvidencePackRow {
+export interface EvidencePackRow {
   id: string;
   task_id: string;
   version: number;
@@ -325,7 +331,7 @@ interface EvidencePackRow {
   content_hash: string;
 }
 
-function evidencePackFromRow(row: EvidencePackRow): EvidencePack {
+export function evidencePackFromRow(row: EvidencePackRow): EvidencePack {
   return {
     id: row.id,
     taskId: row.task_id,
@@ -507,6 +513,10 @@ class SqliteApprovalRepository implements ApprovalRepository {
       });
   }
 
+  async delete(id: string): Promise<void> {
+    this.db.prepare("DELETE FROM approvals WHERE id = ?").run(id);
+  }
+
   async findByTask(taskId: string): Promise<ApprovalRecord[]> {
     const rows = this.db
       .prepare("SELECT * FROM approvals WHERE task_id = ? ORDER BY approved_at ASC")
@@ -643,17 +653,37 @@ class SqliteRepairRecordRepository implements RepairRecordRepository {
   constructor(private readonly db: DatabaseType) {}
 
   async save(record: RepairRecord): Promise<void> {
+    const existing = this.db
+      .prepare("SELECT project_id, task_id FROM repair_records WHERE id = ?")
+      .get(record.id) as
+        | { project_id: string; task_id: string }
+        | undefined;
+    if (
+      existing &&
+      (existing.project_id !== record.projectId || existing.task_id !== record.taskId)
+    ) {
+      throw new RepairMemoryWriteError(
+        "identity_mismatch",
+        `Repair Record ${record.id} 的 projectId/taskId 身份不可变`
+      );
+    }
     this.db
       .prepare(
-        `INSERT INTO repair_records (id, project_id, task_id, status, symptom, root_cause, fix_summary, applicability_conditions_json, failure_reasons_json, input_evidence_pack_id, input_evidence_pack_version, diff_hash, verification_result_json, review_result_json, created_at, updated_at)
-         VALUES (@id, @projectId, @taskId, @status, @symptom, @rootCause, @fixSummary, @applicabilityConditionsJson, @failureReasonsJson, @inputEvidencePackId, @inputEvidencePackVersion, @diffHash, @verificationResultJson, @reviewResultJson, @createdAt, @updatedAt)
+        `INSERT INTO repair_records (id, project_id, task_id, status, symptom, root_cause, root_cause_confidence, root_cause_evidence_ids_json, fix_summary, applicability_conditions_json, applicability_evidence_json, failure_reasons_json, input_evidence_pack_id, input_evidence_pack_version, input_evidence_pack_content_hash, diff_hash, verification_result_json, review_result_json, created_at, updated_at)
+         VALUES (@id, @projectId, @taskId, @status, @symptom, @rootCause, @rootCauseConfidence, @rootCauseEvidenceIdsJson, @fixSummary, @applicabilityConditionsJson, @applicabilityEvidenceJson, @failureReasonsJson, @inputEvidencePackId, @inputEvidencePackVersion, @inputEvidencePackContentHash, @diffHash, @verificationResultJson, @reviewResultJson, @createdAt, @updatedAt)
          ON CONFLICT(id) DO UPDATE SET
            status = @status,
            symptom = @symptom,
            root_cause = @rootCause,
+           root_cause_confidence = @rootCauseConfidence,
+           root_cause_evidence_ids_json = @rootCauseEvidenceIdsJson,
            fix_summary = @fixSummary,
            applicability_conditions_json = @applicabilityConditionsJson,
+           applicability_evidence_json = @applicabilityEvidenceJson,
            failure_reasons_json = @failureReasonsJson,
+           input_evidence_pack_id = @inputEvidencePackId,
+           input_evidence_pack_version = @inputEvidencePackVersion,
+           input_evidence_pack_content_hash = @inputEvidencePackContentHash,
            diff_hash = @diffHash,
            verification_result_json = @verificationResultJson,
            review_result_json = @reviewResultJson,
@@ -666,11 +696,15 @@ class SqliteRepairRecordRepository implements RepairRecordRepository {
         status: record.status,
         symptom: record.symptom,
         rootCause: record.rootCause,
+        rootCauseConfidence: record.rootCauseConfidence ?? null,
+        rootCauseEvidenceIdsJson: toJson(record.rootCauseEvidenceIds),
         fixSummary: record.fixSummary,
         applicabilityConditionsJson: toJson(record.applicabilityConditions),
+        applicabilityEvidenceJson: toJson(record.applicabilityConditionEvidence),
         failureReasonsJson: toJson(record.failureReasons),
         inputEvidencePackId: record.inputEvidencePackId,
         inputEvidencePackVersion: record.inputEvidencePackVersion,
+        inputEvidencePackContentHash: record.inputEvidencePackContentHash ?? null,
         diffHash: record.diffHash ?? null,
         verificationResultJson: record.verificationResult
           ? toJson(record.verificationResult)
@@ -710,11 +744,15 @@ export interface RepairRecordRow {
   status: "DRAFT" | "VERIFIED" | "APPROVED" | "DEPRECATED";
   symptom: string;
   root_cause: string;
+  root_cause_confidence: number | null;
+  root_cause_evidence_ids_json: string;
   fix_summary: string;
   applicability_conditions_json: string;
+  applicability_evidence_json: string;
   failure_reasons_json: string;
   input_evidence_pack_id: string;
   input_evidence_pack_version: number;
+  input_evidence_pack_content_hash: string | null;
   diff_hash: string | null;
   verification_result_json: string | null;
   review_result_json: string | null;
@@ -730,14 +768,20 @@ export function repairRecordFromRow(row: RepairRecordRow): RepairRecord {
     status: row.status,
     symptom: row.symptom,
     rootCause: row.root_cause,
+    rootCauseConfidence: row.root_cause_confidence ?? undefined,
+    rootCauseEvidenceIds: parseJson<readonly string[]>(row.root_cause_evidence_ids_json),
     fixSummary: row.fix_summary,
     applicabilityConditions: parseJson<readonly string[]>(row.applicability_conditions_json),
+    applicabilityConditionEvidence: parseJson<RepairRecord["applicabilityConditionEvidence"]>(
+      row.applicability_evidence_json
+    ),
     failureReasons: parseJson<readonly string[]>(row.failure_reasons_json),
     inputEvidencePackId: row.input_evidence_pack_id,
     inputEvidencePackVersion: row.input_evidence_pack_version,
+    inputEvidencePackContentHash: row.input_evidence_pack_content_hash ?? undefined,
     diffHash: row.diff_hash ?? undefined,
     verificationResult: row.verification_result_json
-      ? parseJson<VerificationSummary>(row.verification_result_json)
+      ? parseVerificationSummary(row.verification_result_json)
       : undefined,
     reviewResult: row.review_result_json
       ? parseJson<ReviewSummary>(row.review_result_json)
@@ -745,6 +789,58 @@ export function repairRecordFromRow(row: RepairRecordRow): RepairRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+/**
+ * 解析 Repair Record 的验证摘要。
+ *
+ * Phase 5 之前曾把 exitCodes 写成 Map；JSON 往返后旧数据会变成 `{}`。
+ * 新格式使用普通对象；遇到旧格式或损坏 JSON 时保留可读字段并以空对象
+ * 表示不可恢复的退出码，绝不让单条历史记录阻塞整个 SQLite 启动。
+ */
+function parseVerificationSummary(serialized: string): VerificationSummary {
+  try {
+    const raw = JSON.parse(serialized) as Record<string, unknown>;
+    const ranCommands = Array.isArray(raw.ranCommands)
+      ? raw.ranCommands.filter((value): value is string => typeof value === "string")
+      : [];
+    const exitCodes = normalizeExitCodes(raw.exitCodes);
+    const outputTail = typeof raw.truncatedOutputTail === "string"
+      ? raw.truncatedOutputTail
+      : undefined;
+    return {
+      passed: raw.passed === true,
+      ranCommands,
+      exitCodes,
+      ...(outputTail !== undefined ? { truncatedOutputTail: outputTail } : {})
+    };
+  } catch {
+    return { passed: false, ranCommands: [], exitCodes: {} };
+  }
+}
+
+function normalizeExitCodes(value: unknown): Readonly<Record<string, number>> {
+  const result: Record<string, number> = {};
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const [command, exitCode] of Object.entries(value)) {
+      if (typeof exitCode === "number" && Number.isFinite(exitCode)) {
+        result[command] = exitCode;
+      }
+    }
+  } else if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (
+        Array.isArray(entry) &&
+        entry.length === 2 &&
+        typeof entry[0] === "string" &&
+        typeof entry[1] === "number" &&
+        Number.isFinite(entry[1])
+      ) {
+        result[entry[0]] = entry[1];
+      }
+    }
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -997,7 +1093,7 @@ class SqliteExecutionResultRepository implements ExecutionResultRepository {
   }
 }
 
-interface ExecutionResultRow {
+export interface ExecutionResultRow {
   id: string;
   task_id: string;
   run_id: string;
@@ -1012,7 +1108,7 @@ interface ExecutionResultRow {
   created_at: string;
 }
 
-function executionResultFromRow(row: ExecutionResultRow): ExecutionResult {
+export function executionResultFromRow(row: ExecutionResultRow): ExecutionResult {
   return {
     id: row.id,
     taskId: row.task_id,

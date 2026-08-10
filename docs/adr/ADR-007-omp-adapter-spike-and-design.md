@@ -1,8 +1,8 @@
 # ADR-007：OmpAdapter Spike 结果与设计决策
 
-- **状态：** 已接受（Phase 4 实现中，真实闭环与 P1-R01 待独立验收）
+- **状态：** 已接受（Phase 4 已于 2026-08-03 经独立 Reviewer 正式验收通过）
 - **日期：** 2026-07-27
-- **阶段：** Phase 4（真实修复闭环）—— 实现者自测已跑通两个真实失败任务，但未经独立 Reviewer 授权复验；P1-R01 执行期逐路径隔离方案已落地（受控文件工具代理），待独立验收
+- **阶段：** Phase 4（真实修复闭环）—— 受控文件工具代理、两个真实 Omp 合成任务和全部退出门禁均已由独立 Reviewer 复验并正式签发；不可回退边界见 Phase 4 验收报告第 21 节
 - **取代：** ADR-001 中 `OmpAdapter` stub 部分
 - **被取代：** 暂无
 
@@ -13,7 +13,7 @@
 >    **明确拒绝** `--auto-approve` / `--approval-mode=yolo`，改用
 >    `--approval-mode=write`。`--cwd` 仅锁定工作目录，不构成工具级
 >    逐路径 `Plan.allowedPaths` 隔离。
-> 2. **P1-R01 关闭方案（2026-07-30 落地，待独立验收）：** omp develop
+> 2. **P1-R01 关闭方案（2026-07-30 落地，2026-08-03 独立验收通过）：** omp develop
 >    阶段改为 `--tools read,grep,glob`（只读，无 edit/write/bash），
 >    omp 没有任何写入能力。所有文件修改通过 `<file_change>` XML
 >    指令输出，由 `ControlledFileWriter` 代为写入并在**写入前同步**
@@ -23,24 +23,37 @@
 >    （`applyExecutionIsolation` + `watchForSymlinkEscapes` +
 >    `enforceFilesystemScope` + `rollback`）退为恢复层，作为纵深
 >    防御保留，不再是 P1-R01 的主边界。
-> 3. 下表"真实任务闭环 ✅ 已验证"仅为实现者自测，**不能替代独立验收**。
->    Phase 4 真实闭环尚待未参与实现的 Reviewer 在用户明确授权下执行
->    `pnpm test:omp-real` 的两个真实任务（见验收报告 §18.3）。
+> 3. 下表保留实现过程中的自测记录；最终独立 Reviewer 已在用户明确授权下执行
+>    `pnpm test:omp-real` 的两个真实任务并于 2026-08-03 签发 Phase 4。
+>    最终证据以验收报告第 21 节为准。
+
+> **Review 输出通道修正（2026-08-10，对应 PHASE-5-ACCEPTANCE-REVIEW §21.3 P2-11）：**
+>
+> 1. `analyze` 与 `develop` 使用 `--mode json`，只解析 NDJSON Runtime 事件；
+>    `review` 使用 `--mode text --no-tools`，只接收最终 assistant 文本，避免事件流
+>    头部截断后丢失末尾 ReviewResult。
+> 2. 当前 Review 只接受裸 JSON、恰好一层成对 Markdown JSON 围栏，以及经真实输出
+>    证据确认的有限单边围栏；归一化后必须对全文执行严格 JSON/schema 校验。禁止扫描
+>    平衡花括号、从说明文字抽取对象，或按场景补造 finding。
+> 3. 已在本机 `omp v17.1.5 --help` 评估原生结构化输出能力：已公开的 `--mode` 只有
+>    `text`、`json`、`rpc`、`rpc-ui`，未发现可验证的 JSON schema/response-format 参数。
+>    因此当前不启用未经 Spike 与契约测试验证的配置；若未来版本提供该能力，必须先新增
+>    Adapter 契约测试和 ADR 更新，才能替换现有 text + 严格解析边界。
 
 ## 实现状态（2026-07-30 更新）
 
 | 项 | 状态 | 说明 |
 | --- | --- | --- |
 | Spike（omp 安装与 CLI 拓扑验证） | ✅ 已完成 | omp v17.1.5 安装成功，CLI 参数与 worktree 约束已验证 |
-| `OmpAdapter` 代码框架 | ✅ 已落地 | `packages/adapters/src/omp-adapter.ts` 实现 `analyze`/`develop`/`review`/`cancel`，含 prompt 构造、NDJSON 解析、ReviewResult 容错提取、`validateOmpArgv` 等价 CommandPolicy |
+| `OmpAdapter` 代码框架 | ✅ 已落地 | `packages/adapters/src/omp-adapter.ts` 实现 `analyze`/`develop`/`review`/`cancel`，含 prompt 构造、NDJSON 解析、ReviewResult 严格全文提取、`validateOmpArgv` 等价 CommandPolicy |
 | 受控 argv 拓扑 | ✅ 已落地 | 固定使用 `--approval-mode=write`（非 yolo/`--auto-approve`）+ `--no-session` + `--no-extensions` + `--no-skills` + `--no-rules`；`validateOmpArgv` 将三者列为必需项，缺失任一抛 `missing-no-auto-discovery-flag` |
-| **受控文件工具代理（P1-R01 §18.3 关闭方案）** | ✅ 已落地（待独立验收） | **omp develop 阶段使用 `--tools read,grep,glob`（只读，无 edit/write/bash/browser）。** omp 没有任何写入能力，所有文件修改通过 `<file_change>` XML 指令输出，由 `ControlledFileWriter` 代为写入并在**写入前同步**校验路径：(1) `isProtectedPath` 拒绝 `.git` 等受保护路径；(2) `resolve`+`relative` 规范化路径，捕获 `..` 穿越、绝对路径、跨盘符逃逸；(3) `findPathScopeViolations` 校验 allowedPaths glob 匹配；(4) `lstatSync`+`readlinkSync`+`isSymlinkTargetOutsideWorktree` 检查符号链接逃逸。任一文件越界立即抛 `PathScopeViolationError`，不写入任何文件（原子性）。**实现者自测**：17 个真实文件系统对抗性测试覆盖合法写入、`..` 穿越、绝对路径、`.git` 受保护、符号链接逃逸、原子性、父目录自动创建、端到端模拟 omp develop（含合法与越权）。`validateOmpArgv` 同时拒绝 `--tools` 包含 `bash/edit/write/browser` 等任何写入工具。 |
+| **受控文件工具代理（P1-R01 §18.3 关闭方案）** | ✅ 已独立验收通过 | **omp develop 阶段使用 `--tools read,grep,glob`（只读，无 edit/write/bash/browser）。** omp 没有任何写入能力，所有文件修改通过 `<file_change>` XML 指令输出，由 `ControlledFileWriter` 代为写入并在**写入前同步**校验路径：(1) `isProtectedPath` 拒绝 `.git` 等受保护路径；(2) `resolve`+`relative` 规范化路径，捕获 `..` 穿越、绝对路径、跨盘符逃逸；(3) `findPathScopeViolations` 校验 allowedPaths glob 匹配；(4) `lstatSync`+`readlinkSync`+`isSymlinkTargetOutsideWorktree` 检查符号链接逃逸。任一文件越界立即抛 `PathScopeViolationError`，不写入任何文件（原子性）。`validateOmpArgv` 同时拒绝 `--tools` 包含 `bash/edit/write/browser` 等任何写入工具。最终对抗性测试和真实任务证据见 Phase 4 验收报告第 21 节。 |
 | 执行期路径隔离（P1-R01 恢复层） | ✅ 已落地（恢复层） | 四层防御现为**恢复层**：(1) `applyExecutionIsolation` 将非 allowedPaths 文件设只读 + 符号链接逃逸检测 + 失败关闭；(2) `watchForSymlinkEscapes` 用 `fs.watch` 递归监听 worktree，近实时检测新增符号链接逃逸并 abort Runtime；(3) `enforceFilesystemScope` 在 Runtime 结束后检测新增/改指向的符号链接目标是否逃逸；(4) `rollback` 回滚越界变更。**主边界为受控文件工具代理**（见上行），omp 无写入能力，恢复层仅作为纵深防御与异常情况下的兜底。 |
 | 单元测试 | ✅ 已通过 | OmpAdapter 测试（71 个）+ `local-controlled-file-writer` 测试（17 个）+ smoke 测试 + `--no-*` 契约测试 + `applyExecutionIsolation` 直接单元测试全部通过 |
 | 组合根受控装配 | ✅ 已落地 | `apps/api/src/composition-root.ts` 通过 `TRACEPILOT_OMP_PATH` 与 `TRACEPILOT_OMP_MODEL` 环境变量受控切换 OmpAdapter 与 LocalCommandAdapter 降级模式；OmpAdapter 装配时注入 `LocalControlledFileWriter`；`.env` 文件自动加载（Node 22+ `process.loadEnvFile`，零依赖） |
 | LLM 提供商连通性 | ✅ 已验证（实现者自测） | DeepSeek `deepseek-v4-flash` 经 `DEEPSEEK_API_KEY` 环境变量连通验证通过；白名单透传 `DEEPSEEK_API_KEY` 等凭据给 omp 子进程 |
 | `.env` 配置支持 | ✅ 已落地 | `ProcessPolicy.allowedEnvVarNames` 白名单字段 + `LocalProcessRunner.buildChildEnv` 按白名单透传 + `.env.example` 模板 + `skipEnvFile` 测试选项 |
-| 真实任务闭环 | ⚠️ 实现者自测通过，待独立验收 | 实现者自测：两个真实失败任务由 OmpAdapter + DeepSeek 完成 develop→verify→review。**此为实现者自测，不能替代独立验收。** 尚待未参与实现的 Reviewer 在用户授权下执行 `pnpm test:omp-real` |
+| 真实任务闭环 | ✅ 已独立验收通过 | 独立 Reviewer 在用户明确授权下运行 `pnpm test:omp-real`；Python 与 JavaScript 两个合成失败仓库均完成 develop→verify→Diff→review 闭环，最终证据见 Phase 4 验收报告第 21 节 |
 | ADR-008（事件协议修订） | ✅ 不需要 | 真实 `--mode json` 事件结构已验证：`session`/`message_update`(含 `thinking_end`/`toolcall_end` 子类型)/`tool_execution_start`/`tool_execution_end`/`turn_end`(isTerminal) 等。`parseOmpNdjsonEvents` 与 `mapOmpObjectToRuntimeEvent` 已按真实事件类型实现，单元测试已同步更新。无需新增 ADR-008 |
 
 ## 背景
@@ -75,7 +88,8 @@ Phase 4 进入后，本次 Spike 已成功安装 `omp v17.1.5` 并验证其非�
 | 参数 | 用途 | TracePilot 映射 |
 | --- | --- | --- |
 | `-p` / `--print` | 非交互模式：处理 prompt 后退出 | `analyze` / `develop` / `review` 必须使用 |
-| `--mode json` | JSON 输出模式（流式事件） | `RuntimeEvent` 转换源 |
+| `--mode json` | JSON 输出模式（流式事件） | `analyze` / `develop` 的 `RuntimeEvent` 转换源 |
+| `--mode text` | 最终文本输出模式 | `review` 的最终 assistant ReviewResult 文本；不解析 NDJSON 事件流 |
 | `--cwd=<path>` | 指定工作目录 | worktree 约束（受控根目录）。**注意：`--cwd` 仅锁定工作目录，不构成工具级逐路径 `Plan.allowedPaths` 隔离。** 执行期路径隔离由 `applyExecutionIsolation` + 快照检测 + 回滚恢复组成 |
 | `--approval-mode=write` | 工作区写入审批模式 | **当前使用**。允许 omp 编辑工作区内文件，但不等价于逐路径白名单 |
 | `--auto-approve` | 自动批准所有工具调用 | **已拒绝**。`validateOmpArgv` 拒绝包含此参数的 argv |
@@ -86,7 +100,7 @@ Phase 4 进入后，本次 Spike 已成功安装 `omp v17.1.5` 并验证其非�
 | `--no-rules` | 禁用自动发现的规则 | **P1-R01 必需**。同上 |
 | `--max-time=<duration>` | 超时控制（如 `600`、`10m`、`1h`） | `ProcessPolicy.timeoutMs` |
 | `--model=<name>` | 指定 LLM 模型 | 由项目配置注入 |
-| `--no-tools` | 禁用所有内置工具 | 纯分析模式（可选） |
+| `--no-tools` | 禁用所有内置工具 | `review` 必需；只基于 Prompt 中已给定的 Diff 与验证结果作结论 |
 | `--add-dir=<path>` | 添加额外工作区目录 | 只读引用其他目录 |
 | `--no-lsp` | 禁用 LSP | 降级模式 |
 | `--config=<path>` | 加载额外配置覆盖 | 项目级配置 |
@@ -136,13 +150,17 @@ Phase 4 进入后，本次 Spike 已成功安装 `omp v17.1.5` 并验证其非�
   但不修改文件（可配合 `--no-tools` 限制为只读，或通过 prompt 指令约束）。
 - **`develop`**：prompt 要求 omp 修复指定失败，明确约束 `allowedPaths` 与命令白名单，
   修改完成后运行验证命令。
-- **`review`**：prompt 要求 omp 基于给定的 diff + 验证结果输出结构化 JSON 裁决
-  （P0-P3 findings、verdict、summary）。
+- **`review`**：使用 `--mode text --no-tools`；prompt 要求 omp 基于给定的 diff +
+  验证结果只输出结构化 JSON 裁决（P0-P3 findings、verdict、summary），不调用工具。
 
-### 流式事件协议
+### 流式事件与 Review 文本协议
 
-`--mode json` 输出流式 JSON 事件（每行一个 JSON 对象，NDJSON 格式）。
-具体事件类型与字段需在 API key 配置后实际跑通验证（见 §待解决问题）。
+`analyze` 与 `develop` 的 `--mode json` 输出流式 JSON 事件（每行一个 JSON 对象，
+NDJSON 格式）。具体事件类型与字段需在 API key 配置后实际跑通验证（见 §待解决问题）。
+
+`review` 的 `--mode text` 只接收最终文本。该文本仅允许裸 JSON、恰好一层成对
+Markdown JSON 围栏，或经真实证据确认的有限单边围栏；归一化后仍须对全文执行严格
+JSON/schema 校验。任何前后说明、多重/内嵌围栏、截断或 schema 错误都必须失败关闭。
 
 ### 取消信号
 
@@ -155,8 +173,9 @@ Phase 4 进入后，本次 Spike 已成功安装 `omp v17.1.5` 并验证其非�
    `analyze` / `develop` / `review` / `cancel`。`LocalCommandAdapter` 降级为测试与
    Spike 用途（ADR-001 第 3 条保留有效）。
 
-2. **调用方式：`omp -p --mode json --cwd <worktree> --approval-mode=write --no-session --no-extensions --no-skills --no-rules --max-time <ms> "<prompt>"`。**
-   - `--mode json` 输出 NDJSON 事件流，`OmpAdapter` 解析并转换为 `RuntimeEvent`；
+2. **调用方式按阶段固定。**
+   - `analyze` / `develop`：`omp -p --mode json --cwd <worktree> --approval-mode=write --no-session --no-extensions --no-skills --no-rules --max-time <ms> --tools <phase-tools> "<prompt>"`；`--mode json` 输出 NDJSON 事件流，`OmpAdapter` 解析并转换为 `RuntimeEvent`；
+   - `review`：`omp -p --mode text --cwd <worktree> --approval-mode=write --no-session --no-extensions --no-skills --no-rules --max-time <ms> --no-tools "<prompt>"`；只接收最终 assistant 文本并严格解析 ReviewResult；
    - `--cwd` 锁定工作目录到受控 worktree（**不构成工具级路径隔离**）；
    - `--approval-mode=write` 允许工作区写入（**拒绝 yolo/`--auto-approve`**）；
    - `--no-extensions` + `--no-skills` + `--no-rules` 禁用自动发现能力（P1-R01 必需）；
@@ -177,13 +196,15 @@ Phase 4 进入后，本次 Spike 已成功安装 `omp v17.1.5` 并验证其非�
    - 命令白名单（来自 `ProjectCommands`）；
    - 失败堆栈（来自 `TaskInput.failure`）。
 
-6. **`review` 输出结构化 JSON。** prompt 要求 omp 输出符合 `ReviewResult` 接口的
-   JSON（`verdict` + `findings[]` + `summary`），`OmpAdapter.review` 解析 omp 的
-   文本输出提取 JSON。
+6. **`review` 输出结构化 JSON。** `review` 使用 `--mode text --no-tools`；prompt 要求
+   omp 只输出符合 `ReviewResult` 接口的 JSON（`verdict` + `findings[]` + `summary`）。
+   `OmpAdapter.review` 仅接受裸 JSON、严格成对围栏和经真实证据确认的有限单边围栏，
+   并在归一化后对全文执行严格 JSON/schema 校验；不得扫描任意自然语言中的 JSON 子串。
+   当前已验证 CLI 没有原生 JSON schema 参数，故不使用未经 Spike 验证的结构化输出配置。
 
-## 待解决问题（实现者自测，待独立验收）
+## 验收结果与待跟踪项
 
-以下问题在实现者自测中已验证，但 Phase 4 真实闭环尚待独立 Reviewer 授权复验（见 `docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md`）：
+以下实现项已经过 Phase 4 独立验收；仍需长期跟踪的成本项单独保留。最终证据见 `docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md` 第 21 节：
 
 1. ✅ `--mode json` 的具体事件类型与字段结构已确认：`session`、`agent_start`、
    `turn_start`/`turn_end`(含 `isTerminal`)、`message_start`/`message_end`、
@@ -197,9 +218,9 @@ Phase 4 进入后，本次 Spike 已成功安装 `omp v17.1.5` 并验证其非�
    退出后调用 `WorktreeManager.captureDiffForTask` 获取 DiffArtifact，验证
    `changedFiles` 包含预期文件（`src/users.py` / `src/users.js`）。
 
-3. ✅ `review` JSON 输出可靠性：`extractReviewResult` 三级容错（整段解析 →
-   平衡花括号子串 → 启发式回退）在真实输出中有效。omp + DeepSeek 在两个
-   任务上均返回有效裁决（`ship` / `ship_with_fixes` / `block` 之一）。
+3. ✅ Review 传输边界：`review` 使用 `--mode text --no-tools`，避免将 NDJSON 事件头部
+   当作 ReviewResult；`extractReviewResult` 只对完整文本作严格解析，不扫描平衡花括号
+   或从说明文字抽取对象。真实 Review 输出稳定性仍由 Phase 5 的独立验收持续验证。
 
 4. ⏳ omp 的 token 消耗与成本：尚未在基准任务上测量，后续可按需收集。
 
@@ -209,23 +230,21 @@ Phase 4 进入后，本次 Spike 已成功安装 `omp v17.1.5` 并验证其非�
 ## 影响
 
 - **正面影响：** `OmpAdapter` 与 `LocalCommandAdapter` 共享 `RuntimeAdapter` 契约，
-  替换成本为零；omp 的 LSP/DAP 能力为后续 Phase 7 运行时调试证据提供基础。
-  实现者自测已跑通两个真实失败任务闭环（Python + JavaScript），**但此为实现者
-  自测，不等于 Phase 4 验收通过**——尚待未参与实现的 Reviewer 在用户授权下执行
-  `pnpm test:omp-real` 的独立复验。
-- **负面影响：** `OmpAdapter` 依赖外部 LLM API key，本地无网络时不可用；omp 的
-  `--mode json` 输出格式未官方文档化，可能随版本变化（已通过容错解析缓解）；
-  prompt 驱动的 `review` 输出不保证结构化 JSON，需容错解析（已通过三级容错缓解）。
-- **P1-R01 状态（2026-07-30 落地，待独立验收）：** omp develop 阶段使用
+  替换成本为零；omp 的 LSP/DAP 能力为后续运行时调试证据提供基础。Python 与
+  JavaScript 两个真实合成失败任务已经独立 Reviewer 复验通过。
+- **负面影响：** `OmpAdapter` 依赖外部 LLM API key，本地无网络时不可用；analyze/develop
+  的 `--mode json` 事件格式未官方文档化，可能随版本变化；prompt 驱动的 `review`
+  也不保证结构化 JSON。两者均通过固定 argv、严格全文解析、失败关闭和 Adapter 契约测试
+  降低风险，而不接受任意文本中的 JSON 片段。
+- **P1-R01 状态（2026-07-30 落地，2026-08-03 独立验收通过）：** omp develop 阶段使用
   `--tools read,grep,glob`（只读，无 edit/write/bash），所有文件修改通过
   `<file_change>` XML 指令输出，由 `ControlledFileWriter` 代为写入并在写入前
   同步校验路径（allowedPaths glob 匹配 + 受保护路径检查 + 路径穿越检查 + 符号链接
   逃逸检查）。这是"同步、操作前、逐路径"的强制边界（§18.3 要求），omp 无写入
   能力，从源头杜绝越权写入。原四层防御（`applyExecutionIsolation` +
   `watchForSymlinkEscapes` + `enforceFilesystemScope` + `rollback`）退为恢复层，
-  作为纵深防御保留。**实现者自测通过**（17 个真实文件系统对抗性测试 + 71 个
-  OmpAdapter 单元测试），但 Phase 4 整体验收仍待独立 Reviewer 复验。
-- **后续动作：** Phase 4 真实闭环待独立 Reviewer 授权复验（见
-  `docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md` §18.3），无需新增 ADR-008。
-  后续可按需收集 omp 的 token 消耗与成本数据，并在 omp 版本升级时回归验证
-  事件协议与 `<file_change>` XML 输出格式。
+  作为纵深防御保留。最终独立验收覆盖真实路径、链接逃逸、TOCTOU 与两个真实
+  Omp 任务；具体数量和命令以 Phase 4 验收报告第 21 节为准。
+- **后续动作：** Phase 4 已完成，不需要新增 ADR-008。后续可按需收集 omp 的
+  token 消耗与成本数据，并在 omp 版本升级时回归验证事件协议与
+  `<file_change>` XML 输出格式；任何 Phase 4 安全边界变更都必须重新独立复核。

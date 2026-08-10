@@ -23,7 +23,6 @@ import {
   transition,
   isTerminalStatus,
   IllegalTransitionError,
-  canComplete,
   isApprovalInvalidated
 } from "../domain/task.js";
 import type { Project, ProjectCommands } from "../domain/project.js";
@@ -36,16 +35,110 @@ import type {
   EvidenceKind
 } from "../domain/evidence.js";
 import { computePackContentHash, nextPackVersion } from "../domain/evidence.js";
-import type { Worktree } from "../ports/adapters.js";
+import type { ReviewResult, Worktree } from "../ports/adapters.js";
+import type {
+  RepairRecord,
+  ReviewFinding,
+  ReviewSummary,
+  VerificationSummary
+} from "../domain/repair-record.js";
+import { transitionRepairRecord } from "../domain/repair-record.js";
+import {
+  evaluateReviewQuality,
+  isReviewFindingCategory,
+  type ReviewQualityGateResult
+} from "../domain/review.js";
 import type {
   AuditEvent,
   AuditEventType
 } from "../domain/audit.js";
 import { createAuditEvent, randomId } from "../domain/audit.js";
 import type { UnitOfWork, TransactionalRepos } from "../ports/repositories.js";
+import type { HumanDecisionFinalizationGuard } from "../ports/human-decision-finalization.js";
 
 export interface OrchestratorDeps {
   readonly unitOfWork: UnitOfWork;
+  /** 只供可信人工通道使用的身份与挑战凭证配置。 */
+  readonly humanApproval?: HumanApprovalConfig;
+  /** 最终 Diff、任务级互斥、提交后复核与失败补偿的强制守卫。 */
+  readonly humanDecisionFinalizationGuard?: HumanDecisionFinalizationGuard;
+}
+
+export interface HumanApprovalConfig {
+  /** 服务端配置的人工身份，不从 HTTP 请求体读取。 */
+  readonly identity?: string;
+  /** 仅在人类 UI/CLI 通道中提供的共享凭证；绝不注入 Runtime 进程。 */
+  readonly channelSecret?: string;
+  /** 一次性挑战有效期，默认 5 分钟。 */
+  readonly challengeTtlMs?: number;
+}
+
+export interface HumanApprovalChallenge {
+  readonly challengeId: string;
+  /** 一次性随机凭证；只在签发响应中返回，服务端只保存其摘要。 */
+  readonly challengeToken: string;
+  readonly taskId: string;
+  readonly repairRecordId: string;
+  readonly evidencePackId: string;
+  readonly evidencePackVersion: number;
+  readonly evidencePackContentHash: string;
+  readonly diffHash: string;
+  readonly decision: "approved" | "rejected";
+  readonly approver: string;
+  readonly expiresAt: string;
+}
+
+interface PendingHumanApprovalChallenge {
+  readonly challengeId: string;
+  readonly taskId: string;
+  readonly repairRecordId: string;
+  readonly evidencePackId: string;
+  readonly evidencePackVersion: number;
+  readonly evidencePackContentHash: string;
+  readonly diffHash: string;
+  readonly decision: "approved" | "rejected";
+  readonly approver: string;
+  readonly expiresAt: string;
+  readonly tokenHash: string;
+  consumed: boolean;
+}
+
+export class HumanApprovalConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HumanApprovalConfigurationError";
+  }
+}
+
+export class HumanApprovalCredentialError extends Error {
+  constructor(message = "人工审批通道凭证无效") {
+    super(message);
+    this.name = "HumanApprovalCredentialError";
+  }
+}
+
+export class HumanApprovalChallengeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HumanApprovalChallengeError";
+  }
+}
+
+export class HumanApprovalPathError extends Error {
+  constructor() {
+    super("人工审批不得通过通用 recordApproval 入口，必须使用一次性挑战并走 recordHumanDecision");
+    this.name = "HumanApprovalPathError";
+  }
+}
+
+/** 安全敏感状态只能由对应领域闭环进入，通用迁移入口一律拒绝。 */
+export class SensitiveTransitionPathError extends IllegalTransitionError {
+  constructor(to: TaskStatus) {
+    super(
+      `禁止通过 transitionTask 迁移到 ${to} —— 必须使用对应的 Review、审批或终态领域服务`
+    );
+    this.name = "SensitiveTransitionPathError";
+  }
 }
 
 /** 任务不存在时抛出。 */
@@ -82,7 +175,38 @@ export class InvalidApprovalStateError extends Error {
   }
 }
 
+/** Phase 5：任务尚未生成可审计的 Review / Repair Record。 */
+export class ReviewNotReadyError extends Error {
+  constructor(taskId: string, message: string) {
+    super(`任务 ${taskId} 尚未满足 Phase 5 Review 条件：${message}`);
+    this.name = "ReviewNotReadyError";
+  }
+}
+
+export interface ReviewGateAndMemoryResult {
+  readonly task: Task;
+  readonly repairRecord: RepairRecord;
+  readonly qualityGate: ReviewQualityGateResult;
+}
+
+export interface HumanDecisionResult {
+  readonly task: Task;
+  readonly approval: ApprovalRecord;
+  readonly repairRecord: RepairRecord;
+}
+
+interface CommittedHumanDecision {
+  readonly result: HumanDecisionResult;
+  readonly previousTask: Task;
+  readonly previousRepairRecord: RepairRecord;
+}
+
 export class TaskOrchestrator {
+  private readonly pendingHumanApprovalChallenges = new Map<
+    string,
+    PendingHumanApprovalChallenge
+  >();
+
   constructor(private readonly deps: OrchestratorDeps) {}
 
   /**
@@ -151,16 +275,6 @@ export class TaskOrchestrator {
       const current = await tx.tasks.findById(taskId);
       if (!current) throw new TaskNotFoundError(taskId);
 
-      // P1-R02：通用迁移接口不得用于进入 EXECUTING。进入 EXECUTING 只能
-      // 经 beginExecutionIfApproved，由它在事务内校验有效执行审批与
-      // scopeHash 一致（§5.2、§7.2）。否则调用方可完全不创建审批记录
-      // 而进入执行态，违反执行审批安全边界。
-      if (to === "EXECUTING") {
-        throw new IllegalTransitionError(
-          `禁止通过 transitionTask 迁移到 EXECUTING —— 必须经 beginExecutionIfApproved 并校验有效执行审批与 scopeHash`
-        );
-      }
-
       const from = current.status;
 
       // P2-01：终态拒绝所有迁移，包括同状态 no-op。
@@ -175,6 +289,20 @@ export class TaskOrchestrator {
         throw new IllegalTransitionError(
           `任务 ${taskId} 已处于 ${from}，拒绝同状态 no-op 迁移`
         );
+      }
+
+      // 通用迁移接口不得进入任何安全敏感状态：
+      // - EXECUTING 只能经 beginExecutionIfApproved；
+      // - AWAITING_HUMAN_APPROVAL 只能经 recordReviewAndGate；
+      // - COMPLETED / REJECTED 只能经 recordHumanDecision。
+      // 这在 Core 层封闭 HTTP、测试辅助代码和未来 Adapter 的所有旁路。
+      if (
+        to === "EXECUTING" ||
+        to === "AWAITING_HUMAN_APPROVAL" ||
+        to === "COMPLETED" ||
+        to === "REJECTED"
+      ) {
+        throw new SensitiveTransitionPathError(to);
       }
 
       // 纯状态机校验，非法边抛错。
@@ -312,21 +440,25 @@ export class TaskOrchestrator {
   }
 
   /**
-   * 记录审批闸门决定。`execution` 与 `human` 审批都持久化 scope 哈希，
-   * 以便后续检测范围扩大并使旧执行审批失效（§5.2）。
+   * 记录执行审批闸门决定。
    *
-   * P2-05：验证任务存在且当前状态允许该类审批。
-   * - execution 审批：仅 AWAITING_EXECUTION_APPROVAL 接受。
-   * - human 审批：仅 AWAITING_HUMAN_APPROVAL 接受。
+   * 人工审批已从这个通用入口移除。人工决定必须经过
+   * `issueHumanApprovalChallenge` 和 `recordHumanDecision`，以保证身份、
+   * 决定、Pack、Diff 与 Repair Record 在同一条受控链路中绑定。
    */
   async recordApproval(args: {
     taskId: string;
-    kind: "execution" | "human";
+    kind: "execution";
     approver: string;
     decision: "approved" | "rejected";
     scopeHash: string;
     reason?: string;
   }): Promise<ApprovalRecord> {
+    // 运行时仍检查 kind，防止未经 TypeScript 编译的调用方传入 human。
+    if ((args as { kind?: unknown }).kind !== "execution") {
+      throw new HumanApprovalPathError();
+    }
+
     const approval: ApprovalRecord = {
       id: randomId("approval"),
       taskId: args.taskId,
@@ -342,12 +474,8 @@ export class TaskOrchestrator {
       // P2-05：验证任务存在与状态。
       const task = await tx.tasks.findById(args.taskId);
       if (!task) throw new TaskNotFoundError(args.taskId);
-      const allowedStatus: Record<typeof args.kind, TaskStatus> = {
-        execution: "AWAITING_EXECUTION_APPROVAL",
-        human: "AWAITING_HUMAN_APPROVAL"
-      };
-      if (task.status !== allowedStatus[args.kind]) {
-        throw new InvalidApprovalStateError(args.taskId, task.status, args.kind);
+      if (task.status !== "AWAITING_EXECUTION_APPROVAL") {
+        throw new InvalidApprovalStateError(args.taskId, task.status, "execution");
       }
 
       await tx.approvals.save(approval);
@@ -355,13 +483,9 @@ export class TaskOrchestrator {
         createAuditEvent({
           taskId: args.taskId,
           type:
-            args.kind === "execution"
-              ? args.decision === "approved"
-                ? "execution_approval_granted"
-                : "execution_approval_requested"
-              : args.decision === "approved"
-                ? "human_approval_granted"
-                : "human_approval_rejected",
+            args.decision === "approved"
+              ? "execution_approval_granted"
+              : "execution_approval_requested",
           approver: args.approver,
           scopeHash: args.scopeHash,
           reason: args.reason
@@ -475,34 +599,497 @@ export class TaskOrchestrator {
   }
 
   /**
-   * 最终完成闸门。见 §5.2 / §12.1：COMPLETED 要求验证通过 + 无 P0/P1 +
-   * 人类审批。Orchestrator 在签发最终迁移前检查这三项。
+   * Phase 5：记录独立 Reviewer 结果并执行质量门。
    *
-   * 注意：本 Phase 1 实现仍接受调用方布尔参数（P2-05 标记为部分实现）。
-   * Phase 5 前必须改为从持久化的验证结果 / Review 结果 / Approval 记录
-   * 中计算，而不是信任调用方传入的布尔值。
+   * Review 结果与执行结果在同一短事务内形成 Repair Record：通过质量门的
+   * 记录进入 VERIFIED 并等待人工审批；存在兼容性问题、缺少回归测试、
+   * P0/P1 或验证失败时进入 DRAFT，任务进入 FAILED，不得进入人工批准。
    */
-  async completeIfEligible(args: {
-    taskId: string;
-    validationPassed: boolean;
-    hasP0OrP1ReviewFindings: boolean;
-    hasHumanApproval: boolean;
-  }): Promise<Task> {
-    if (
-      !canComplete({
-        validationPassed: args.validationPassed,
-        hasP0OrP1ReviewFindings: args.hasP0OrP1ReviewFindings,
-        hasHumanApproval: args.hasHumanApproval
-      })
-    ) {
-      throw new IllegalTransitionError(
-        "任务不满足 COMPLETED 条件：缺少验证 / 评审洁净 / 人类审批"
+  async recordReviewAndGate(args: {
+    readonly taskId: string;
+    readonly review: ReviewResult;
+  }): Promise<ReviewGateAndMemoryResult> {
+    return this.deps.unitOfWork.run(async (tx) => {
+      const task = await tx.tasks.findById(args.taskId);
+      if (!task) throw new TaskNotFoundError(args.taskId);
+      if (task.status !== "REVIEWING") {
+        throw new ReviewNotReadyError(
+          args.taskId,
+          `当前状态为 ${task.status}，Review 只允许在 REVIEWING 状态收口`
+        );
+      }
+
+      const execution = await tx.executionResults.findLatestByTask(args.taskId);
+      if (!execution) {
+        throw new ReviewNotReadyError(args.taskId, "不存在受控 execution_results 记录");
+      }
+      if (!task.currentEvidencePackId || task.currentEvidencePackVersion === undefined) {
+        throw new ReviewNotReadyError(args.taskId, "不存在可回溯的当前 Evidence Pack");
+      }
+      const evidencePack = await tx.evidencePacks.findById(task.currentEvidencePackId);
+      if (
+        !evidencePack ||
+        evidencePack.taskId !== task.id ||
+        evidencePack.version !== task.currentEvidencePackVersion
+      ) {
+        throw new ReviewNotReadyError(
+          args.taskId,
+          "当前 Evidence Pack 不存在、任务归属不一致或版本已变化"
+        );
+      }
+      const computedPackHash = computePackContentHash(evidencePack);
+      if (evidencePack.contentHash !== computedPackHash) {
+        throw new ReviewNotReadyError(
+          args.taskId,
+          "当前 Evidence Pack 内容哈希不一致，拒绝使用未经验证的证据快照"
+        );
+      }
+
+      const qualityGate = evaluateReviewQuality({
+        review: args.review,
+        validationPassed: execution.verificationPassed,
+        evidencePack
+      });
+      const now = new Date().toISOString();
+      const reviewSummary: ReviewSummary = {
+        verdict: args.review.verdict,
+        findings: [...args.review.findings]
+      };
+      const failureReasons = qualityGate.reasons.map((reason) => reason.message);
+      const boundRootCause = qualityGate.passed ? args.review.rootCause : undefined;
+      const applicabilityConditionEvidence = qualityGate.passed
+        ? [...(args.review.applicabilityConditions ?? [])]
+        : [];
+      const applicabilityConditions = applicabilityConditionEvidence.map(
+        (condition) => condition.text
+      );
+      const repairRecord: RepairRecord = {
+        id: randomId("repair"),
+        projectId: task.projectId,
+        taskId: task.id,
+        status: qualityGate.passed ? "VERIFIED" : "DRAFT",
+        symptom: task.input.failure?.stackSummary ?? task.input.objective,
+        rootCause:
+          boundRootCause?.text ??
+          `Review 未提供可验证的 Pack hypothesis：${args.review.summary || task.input.objective}`,
+        ...(boundRootCause ? { rootCauseConfidence: boundRootCause.confidence } : {}),
+        rootCauseEvidenceIds: boundRootCause ? [...boundRootCause.evidenceIds] : [],
+        fixSummary:
+          normalizeText(args.review.fixSummary) ??
+          (args.review.summary || "Reviewer 未提供修复摘要"),
+        applicabilityConditions,
+        applicabilityConditionEvidence,
+        failureReasons,
+        inputEvidencePackId: task.currentEvidencePackId,
+        inputEvidencePackVersion: task.currentEvidencePackVersion,
+        inputEvidencePackContentHash: evidencePack.contentHash,
+        diffHash: execution.diffHash,
+        verificationResult: toVerificationSummary(execution),
+        reviewResult: reviewSummary,
+        createdAt: now,
+        updatedAt: now
+      };
+
+      await tx.repairRecords.save(repairRecord);
+      await tx.audit.append(
+        createAuditEvent({
+          taskId: task.id,
+          type: "repair_record_transitioned",
+          evidencePackId: evidencePack.id,
+          evidencePackVersion: evidencePack.version,
+          evidencePackHash: evidencePack.contentHash,
+          diffHash: execution.diffHash,
+          reason: `记录 Review ${args.review.verdict}：Repair Record ${repairRecord.id} 状态=${repairRecord.status}` +
+            (failureReasons.length > 0 ? `；阻断原因=${failureReasons.join(" | ")}` : "")
+        })
+      );
+
+      const targetStatus: TaskStatus = qualityGate.passed ? "AWAITING_HUMAN_APPROVAL" : "FAILED";
+      transition(task.status, targetStatus);
+      const updatedTask: Task = {
+        ...task,
+        status: targetStatus,
+        updatedAt: now,
+        lastTransitionReason: qualityGate.passed
+          ? "Review 质量门通过，等待人类审批"
+          : `Review 质量门阻断：${failureReasons.join("；") || "Reviewer 未批准"}`
+      };
+      await tx.tasks.save(updatedTask);
+      await tx.audit.append(
+        createAuditEvent({
+          taskId: task.id,
+          type: "task_transitioned",
+          fromStatus: task.status,
+          toStatus: targetStatus,
+          evidencePackId: evidencePack.id,
+          evidencePackVersion: evidencePack.version,
+          evidencePackHash: evidencePack.contentHash,
+          diffHash: execution.diffHash,
+          reason: updatedTask.lastTransitionReason
+        })
+      );
+
+      return { task: updatedTask, repairRecord, qualityGate };
+    });
+  }
+
+  /**
+   * 签发一次性人工审批挑战。
+   *
+   * 挑战由服务端可信身份签发，绑定当前 VERIFIED Repair Record、Evidence
+   * Pack 内容哈希、Review Diff 和决定。原始 token 只返回给可信人工通道，
+   * 内存中只保存摘要；Runtime、验证进程和 Agent 从不接触该凭证。
+   */
+  async issueHumanApprovalChallenge(args: {
+    readonly taskId: string;
+    readonly decision: "approved" | "rejected";
+    readonly channelSecret: string;
+  }): Promise<HumanApprovalChallenge> {
+    const config = requireHumanApprovalConfig(this.deps.humanApproval);
+    assertHumanApprovalSecret(config.channelSecret, args.channelSecret);
+    if (args.decision !== "approved" && args.decision !== "rejected") {
+      throw new HumanApprovalChallengeError("人工审批决定必须是 approved 或 rejected");
+    }
+
+    const binding = await this.deps.unitOfWork.run(async (tx) => {
+      const task = await tx.tasks.findById(args.taskId);
+      if (!task) throw new TaskNotFoundError(args.taskId);
+      if (task.status !== "AWAITING_HUMAN_APPROVAL") {
+        throw new InvalidApprovalStateError(args.taskId, task.status, "human");
+      }
+      const repairRecord = await findLatestRepairRecord(tx, args.taskId);
+      if (!repairRecord || repairRecord.status !== "VERIFIED") {
+        throw new ReviewNotReadyError(args.taskId, "没有可供人工批准的 VERIFIED Repair Record");
+      }
+      const execution = await tx.executionResults.findLatestByTask(args.taskId);
+      if (!execution || !execution.verificationPassed || !repairRecord.reviewResult) {
+        throw new ReviewNotReadyError(args.taskId, "缺少通过验证的受控执行结果或 Review 结果");
+      }
+      if (
+        repairRecord.reviewResult.verdict === "block" ||
+        hasBlockingReviewFindings(repairRecord.reviewResult.findings) ||
+        repairRecord.diffHash !== execution.diffHash ||
+        !repairRecord.inputEvidencePackContentHash
+      ) {
+        throw new ReviewNotReadyError(
+          args.taskId,
+          "Repair Record 与最新受控验证结果不一致、Review 含阻断问题或缺少 Pack 哈希"
+        );
+      }
+      const pack = await tx.evidencePacks.findById(repairRecord.inputEvidencePackId);
+      if (
+        !pack ||
+        pack.taskId !== task.id ||
+        pack.version !== repairRecord.inputEvidencePackVersion ||
+        pack.contentHash !== repairRecord.inputEvidencePackContentHash ||
+        pack.contentHash !== computePackContentHash(pack)
+      ) {
+        throw new ReviewNotReadyError(args.taskId, "审批绑定的 Evidence Pack 不存在或内容哈希不一致");
+      }
+      return {
+        repairRecord,
+        pack,
+        diffHash: execution.diffHash
+      };
+    });
+
+    const challengeToken = createHumanApprovalNonce();
+    const challenge: HumanApprovalChallenge = {
+      challengeId: randomId("human-challenge"),
+      challengeToken,
+      taskId: args.taskId,
+      repairRecordId: binding.repairRecord.id,
+      evidencePackId: binding.pack.id,
+      evidencePackVersion: binding.pack.version,
+      evidencePackContentHash: binding.pack.contentHash,
+      diffHash: binding.diffHash,
+      decision: args.decision,
+      approver: config.identity,
+      expiresAt: new Date(Date.now() + resolveChallengeTtlMs(this.deps.humanApproval)).toISOString()
+    };
+    this.pendingHumanApprovalChallenges.set(challenge.challengeId, {
+      challengeId: challenge.challengeId,
+      taskId: challenge.taskId,
+      repairRecordId: challenge.repairRecordId,
+      evidencePackId: challenge.evidencePackId,
+      evidencePackVersion: challenge.evidencePackVersion,
+      evidencePackContentHash: challenge.evidencePackContentHash,
+      diffHash: challenge.diffHash,
+      decision: challenge.decision,
+      approver: challenge.approver,
+      expiresAt: challenge.expiresAt,
+      tokenHash: await hashHumanApprovalToken(challengeToken),
+      consumed: false
+    });
+    return challenge;
+  }
+
+  /**
+   * 使用一次性人工审批挑战完成最终决定。
+   *
+   * 该方法是人工审批唯一领域入口：审批记录、Repair Record 状态、任务
+   * 终态和审计事件在同一 UnitOfWork 事务内提交。挑战消费失败或事务失败
+   * 都不会留下可重放的凭证。
+   */
+  async recordHumanDecision(args: {
+    readonly taskId: string;
+    readonly challengeToken: string;
+    readonly channelSecret: string;
+    readonly reason?: string;
+  }): Promise<HumanDecisionResult> {
+    const config = requireHumanApprovalConfig(this.deps.humanApproval);
+    assertHumanApprovalSecret(config.channelSecret, args.channelSecret);
+    const finalizationGuard = this.deps.humanDecisionFinalizationGuard;
+    if (!finalizationGuard) {
+      throw new HumanApprovalConfigurationError(
+        "未配置人工决定最终 Diff 提交守卫，拒绝完成审批"
       );
     }
-    return this.transitionTask(args.taskId, "COMPLETED", {
-      reason: "验证通过、评审无 P0/P1、人类审批已记录",
-      auditEventType: "task_transitioned"
+    const pending = await this.takeHumanApprovalChallenge(args.taskId, args.challengeToken);
+    const challenge = pending;
+
+    try {
+      const committed = await finalizationGuard.finalize<CommittedHumanDecision>({
+        taskId: args.taskId,
+        expectedDiffHash: challenge.diffHash,
+        commit: () => this.commitHumanDecision(args, challenge),
+        compensate: (decision) => this.compensateHumanDecision(decision, challenge)
+      });
+      return committed.result;
+    } finally {
+      this.pendingHumanApprovalChallenges.delete(challenge.challengeId);
+    }
+  }
+
+  /** 在最终 Diff 守卫持有任务级关键区时提交领域原子事务。 */
+  private async commitHumanDecision(
+    args: {
+      readonly taskId: string;
+      readonly reason?: string;
+    },
+    challenge: PendingHumanApprovalChallenge
+  ): Promise<CommittedHumanDecision> {
+    return this.deps.unitOfWork.run(async (tx) => {
+        const task = await tx.tasks.findById(args.taskId);
+        if (!task) throw new TaskNotFoundError(args.taskId);
+        if (task.status !== "AWAITING_HUMAN_APPROVAL") {
+          throw new InvalidApprovalStateError(args.taskId, task.status, "human");
+        }
+
+        const repairRecord = await findLatestRepairRecord(tx, args.taskId);
+        if (!repairRecord || repairRecord.status !== "VERIFIED") {
+          throw new ReviewNotReadyError(args.taskId, "没有可供人工批准的 VERIFIED Repair Record");
+        }
+        const execution = await tx.executionResults.findLatestByTask(args.taskId);
+        const pack = await tx.evidencePacks.findById(challenge.evidencePackId);
+        if (
+          !execution ||
+          !execution.verificationPassed ||
+          !repairRecord.reviewResult ||
+          repairRecord.reviewResult.verdict === "block" ||
+          hasBlockingReviewFindings(repairRecord.reviewResult.findings) ||
+          repairRecord.id !== challenge.repairRecordId ||
+          repairRecord.diffHash !== challenge.diffHash ||
+          execution.diffHash !== challenge.diffHash ||
+          repairRecord.inputEvidencePackId !== challenge.evidencePackId ||
+          repairRecord.inputEvidencePackVersion !== challenge.evidencePackVersion ||
+          repairRecord.inputEvidencePackContentHash !== challenge.evidencePackContentHash ||
+          !pack ||
+          pack.taskId !== task.id ||
+          pack.version !== challenge.evidencePackVersion ||
+          pack.contentHash !== challenge.evidencePackContentHash ||
+          pack.contentHash !== computePackContentHash(pack)
+        ) {
+          throw new ReviewNotReadyError(
+            args.taskId,
+            "人工挑战绑定的 Repair Record、Evidence Pack 或受控 Diff 已变化"
+          );
+        }
+
+        const scopeHash = await computeCurrentScopeHashFromTx(tx, args.taskId);
+        const now = new Date().toISOString();
+        const approval: ApprovalRecord = {
+          id: randomId("approval"),
+          taskId: args.taskId,
+          kind: "human",
+          approver: challenge.approver,
+          decision: challenge.decision,
+          reason: args.reason,
+          approvedAt: now,
+          scopeHash
+        };
+        await tx.approvals.save(approval);
+        await tx.audit.append(
+          createAuditEvent({
+            taskId: args.taskId,
+            type: challenge.decision === "approved" ? "human_approval_granted" : "human_approval_rejected",
+            evidencePackId: challenge.evidencePackId,
+            evidencePackVersion: challenge.evidencePackVersion,
+            evidencePackHash: challenge.evidencePackContentHash,
+            approver: challenge.approver,
+            scopeHash,
+            diffHash: challenge.diffHash,
+            reason: args.reason
+          })
+        );
+
+        const nextRecordStatus = challenge.decision === "approved" ? "APPROVED" : "DEPRECATED";
+        const updatedRecord: RepairRecord = {
+          ...repairRecord,
+          status: transitionRepairRecord(repairRecord.status, nextRecordStatus),
+          updatedAt: now,
+          failureReasons:
+            challenge.decision === "rejected" && args.reason
+              ? [...repairRecord.failureReasons, `人工拒绝：${args.reason}`]
+              : repairRecord.failureReasons
+        };
+        await tx.repairRecords.save(updatedRecord);
+        await tx.audit.append(
+          createAuditEvent({
+            taskId: args.taskId,
+            type: "repair_record_transitioned",
+            evidencePackId: challenge.evidencePackId,
+            evidencePackVersion: challenge.evidencePackVersion,
+            evidencePackHash: challenge.evidencePackContentHash,
+            diffHash: updatedRecord.diffHash,
+            reason: `Repair Record ${updatedRecord.id}：${repairRecord.status} → ${updatedRecord.status}`
+          })
+        );
+
+        const targetStatus: TaskStatus = challenge.decision === "approved" ? "COMPLETED" : "REJECTED";
+        transition(task.status, targetStatus);
+        const updatedTask: Task = {
+          ...task,
+          status: targetStatus,
+          updatedAt: now,
+          lastTransitionReason:
+            challenge.decision === "approved"
+              ? "人类审批通过，Repair Record 已批准"
+              : `人类审批拒绝：${args.reason ?? "未提供原因"}`
+        };
+        await tx.tasks.save(updatedTask);
+        await tx.audit.append(
+          createAuditEvent({
+            taskId: args.taskId,
+            type: "task_transitioned",
+            fromStatus: task.status,
+            toStatus: targetStatus,
+            evidencePackId: challenge.evidencePackId,
+            evidencePackVersion: challenge.evidencePackVersion,
+            evidencePackHash: challenge.evidencePackContentHash,
+            approver: challenge.approver,
+            diffHash: updatedRecord.diffHash,
+            reason: updatedTask.lastTransitionReason
+          })
+        );
+
+        return {
+          result: { task: updatedTask, approval, repairRecord: updatedRecord },
+          previousTask: task,
+          previousRepairRecord: repairRecord
+        };
+      });
+  }
+
+  /**
+   * 外部进程在审批提交关键区内改动 worktree 时执行失败补偿。
+   *
+   * 人工审批记录被删除，任务与 Repair Record 恢复到审批前状态；既有审计
+   * 事件保持仅追加，并补充明确的失效/回退事件，避免掩盖曾发生的竞态。
+   */
+  private async compensateHumanDecision(
+    committed: CommittedHumanDecision,
+    challenge: PendingHumanApprovalChallenge
+  ): Promise<void> {
+    await this.deps.unitOfWork.run(async (tx) => {
+      const currentTask = await tx.tasks.findById(challenge.taskId);
+      const currentRecord = await tx.repairRecords.findById(challenge.repairRecordId);
+      if (
+        !currentTask ||
+        !currentRecord ||
+        currentRecord.id !== committed.result.repairRecord.id
+      ) {
+        throw new ReviewNotReadyError(
+          challenge.taskId,
+          "审批竞态补偿时任务或 Repair Record 已再次变化"
+        );
+      }
+
+      await tx.approvals.delete(committed.result.approval.id);
+      const now = new Date().toISOString();
+      const restoredRecord: RepairRecord = {
+        ...committed.previousRepairRecord,
+        updatedAt: now
+      };
+      await tx.repairRecords.save(restoredRecord);
+      await tx.audit.append(
+        createAuditEvent({
+          taskId: challenge.taskId,
+          type: "human_approval_invalidated",
+          evidencePackId: challenge.evidencePackId,
+          evidencePackVersion: challenge.evidencePackVersion,
+          evidencePackHash: challenge.evidencePackContentHash,
+          approver: challenge.approver,
+          diffHash: challenge.diffHash,
+          reason: "审批提交关键区检测到 worktree Diff 竞态，人工决定已撤销"
+        })
+      );
+      await tx.audit.append(
+        createAuditEvent({
+          taskId: challenge.taskId,
+          type: "repair_record_transitioned",
+          evidencePackId: challenge.evidencePackId,
+          evidencePackVersion: challenge.evidencePackVersion,
+          evidencePackHash: challenge.evidencePackContentHash,
+          diffHash: challenge.diffHash,
+          reason: `竞态补偿：Repair Record ${currentRecord.id} ${currentRecord.status} → ${restoredRecord.status}`
+        })
+      );
+
+      const restoredTask: Task = {
+        ...committed.previousTask,
+        updatedAt: now,
+        lastTransitionReason: "审批提交关键区检测到 Diff 竞态，已恢复等待重新审批"
+      };
+      await tx.tasks.save(restoredTask);
+      await tx.audit.append(
+        createAuditEvent({
+          taskId: challenge.taskId,
+          type: "task_transitioned",
+          fromStatus: currentTask.status,
+          toStatus: restoredTask.status,
+          evidencePackId: challenge.evidencePackId,
+          evidencePackVersion: challenge.evidencePackVersion,
+          evidencePackHash: challenge.evidencePackContentHash,
+          diffHash: challenge.diffHash,
+          reason: restoredTask.lastTransitionReason
+        })
+      );
     });
+  }
+
+  private async takeHumanApprovalChallenge(
+    taskId: string,
+    challengeToken: string
+  ): Promise<PendingHumanApprovalChallenge> {
+    if (typeof challengeToken !== "string" || challengeToken.length === 0) {
+      throw new HumanApprovalChallengeError("人工审批挑战凭证格式无效");
+    }
+    const tokenHash = await hashHumanApprovalToken(challengeToken);
+    const pending = [...this.pendingHumanApprovalChallenges.values()].find(
+      (candidate) => candidate.tokenHash === tokenHash
+    );
+    if (!pending) throw new HumanApprovalChallengeError("人工审批挑战不存在或已失效");
+    if (pending.taskId !== taskId) {
+      throw new HumanApprovalChallengeError("人工审批挑战不能跨任务使用");
+    }
+    if (pending.consumed) throw new HumanApprovalChallengeError("人工审批挑战已被消费，不能重放");
+    if (Date.parse(pending.expiresAt) <= Date.now()) {
+      this.pendingHumanApprovalChallenges.delete(pending.challengeId);
+      throw new HumanApprovalChallengeError("人工审批挑战已过期");
+    }
+    pending.consumed = true;
+    return pending;
   }
 
   // -----------------------------------------------------------------------
@@ -963,6 +1550,120 @@ export class TaskOrchestrator {
       );
     });
   }
+}
+
+function normalizeText(value: string | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function toVerificationSummary(execution: {
+  readonly verificationExitCode: number;
+  readonly verificationPassed: boolean;
+  readonly verificationStdout: string;
+  readonly verificationStderr: string;
+}): VerificationSummary {
+  const outputTail = `${execution.verificationStdout}\n${execution.verificationStderr}`
+    .trim()
+    .slice(-4096);
+  return {
+    passed: execution.verificationPassed,
+    ranCommands: ["project.commands.test"],
+    exitCodes: { "project.commands.test": execution.verificationExitCode },
+    ...(outputTail.length > 0 ? { truncatedOutputTail: outputTail } : {})
+  };
+}
+
+function hasBlockingReviewFindings(findings: readonly ReviewFinding[]): boolean {
+  return findings.some(
+    (finding) =>
+      finding.priority === "P0" ||
+      finding.priority === "P1" ||
+      !isReviewFindingCategory(finding.category) ||
+      finding.category === "compatibility" ||
+      finding.category === "regression_test"
+  );
+}
+
+async function findLatestRepairRecord(
+  tx: TransactionalRepos,
+  taskId: string
+): Promise<RepairRecord | undefined> {
+  const records = await tx.repairRecords.findByTask(taskId);
+  return [...records].sort((a, b) => {
+    const timeDelta = b.updatedAt.localeCompare(a.updatedAt);
+    return timeDelta !== 0 ? timeDelta : b.id.localeCompare(a.id);
+  })[0];
+}
+
+function requireHumanApprovalConfig(
+  config: HumanApprovalConfig | undefined
+): { identity: string; channelSecret: string } {
+  const identity = config?.identity?.trim();
+  const channelSecret = config?.channelSecret;
+  if (!identity || !channelSecret) {
+    throw new HumanApprovalConfigurationError(
+      "未配置可信人工审批身份或通道凭证，拒绝签发/消费人工审批挑战"
+    );
+  }
+  if (channelSecret.length < 32) {
+    throw new HumanApprovalConfigurationError(
+      "人工审批通道凭证至少需要 32 个字符；请使用密码学安全随机数生成"
+    );
+  }
+  return { identity, channelSecret };
+}
+
+function resolveChallengeTtlMs(config: HumanApprovalConfig | undefined): number {
+  const ttl = config?.challengeTtlMs ?? 5 * 60 * 1000;
+  if (!Number.isFinite(ttl) || ttl <= 0 || ttl > 24 * 60 * 60 * 1000) {
+    throw new HumanApprovalConfigurationError("人工审批挑战有效期配置必须在 1 毫秒至 24 小时之间");
+  }
+  return ttl;
+}
+
+function assertHumanApprovalSecret(expected: string, actual: unknown): void {
+  if (typeof actual !== "string" || !constantTimeEqual(expected, actual)) {
+    throw new HumanApprovalCredentialError();
+  }
+}
+
+function createHumanApprovalNonce(): string {
+  const cryptoApi = (globalThis as {
+    crypto?: { randomUUID?: () => string };
+  }).crypto;
+  if (!cryptoApi?.randomUUID) {
+    throw new HumanApprovalConfigurationError("当前运行时不提供安全随机数，拒绝签发人工审批挑战");
+  }
+  return cryptoApi.randomUUID();
+}
+
+async function hashHumanApprovalToken(token: string): Promise<string> {
+  const cryptoApi = (globalThis as {
+    crypto?: {
+      subtle?: {
+        digest: (algorithm: "SHA-256", data: ArrayBuffer) => Promise<ArrayBuffer>;
+      };
+    };
+  }).crypto;
+  if (!cryptoApi?.subtle?.digest) {
+    throw new HumanApprovalConfigurationError("当前运行时不提供安全摘要，拒绝处理人工审批挑战");
+  }
+  const bytes = new TextEncoder().encode(token);
+  const digest = await cryptoApi.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  const maxLength = Math.max(left.length, right.length);
+  let difference = left.length ^ right.length;
+  for (let index = 0; index < maxLength; index += 1) {
+    difference |= (left.charCodeAt(index) || 0) ^ (right.charCodeAt(index) || 0);
+  }
+  return difference === 0;
 }
 
 /**
