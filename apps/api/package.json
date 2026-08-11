@@ -12,7 +12,8 @@
     "test": "vitest run",
     "test:omp-real": "node -e \"process.env.TRACEPILOT_OMP_REAL_STRICT='1';require('child_process').execSync('vitest run tests/omp-real-closed-loop.test.ts',{stdio:'inherit',env:process.env})\"",
     "test:phase5-real": "node -e \"process.env.TRACEPILOT_PHASE5_REAL_STRICT='1';require('child_process').execSync('vitest run tests/phase5-real-reviewer.test.ts',{stdio:'inherit',env:process.env})\"",
-    "lint": "eslint src tests"
+    "lint": "eslint src tests",
+    "test:phase6-dashboard": "vitest run tests/phase6-dashboard.test.ts tests/phase6-dashboard-browser.test.ts"
   },
   "dependencies": {
     "@tracepilot/core": "workspace:*",
@@ -26,6 +27,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0"
+    "vitest": "^2.1.0",
+    "playwright": "^1.55.0"
   }
 }

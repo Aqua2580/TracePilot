@@ -6,6 +6,14 @@ packages:
 # 的预编译二进制；engines.node 声明 >=22.0.0，engineStrict 确保下限检查。
 engineStrict: true
 
+# pnpm v11 只从本文件读取依赖布局设置。禁用隐藏目录的全量提升，避免两个
+# 不兼容主版本（例如 Ajv 6 与 Ajv 8）被解析为同一个包，导致 ESLint 等
+# 已声明依赖在运行时加载错误版本。
+hoist: false
+strictPeerDependencies: false
+autoInstallPeers: true
+preferWorkspacePackages: true
+
 allowBuilds:
   esbuild: true
   better-sqlite3: true

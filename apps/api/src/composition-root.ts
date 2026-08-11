@@ -45,7 +45,12 @@ import {
   type ProcessRunner,
   type UnitOfWork,
   type HumanDecisionFinalizationGuard,
-  type HumanDecisionFinalizationInput
+  type HumanDecisionFinalizationInput,
+  type AuditEvent,
+  type EvidenceConstraint,
+  type Hypothesis,
+  type ExecutionResult,
+  type Task
 } from "@tracepilot/core";
 import { defaultGovernancePolicies } from "@tracepilot/governance";
 import {
@@ -64,7 +69,8 @@ import {
   RuntimeEventBuffer,
   type SqliteStore
 } from "@tracepilot/store";
-import { resolve, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** 返回 ESM 模块所在目录的文件系统路径。 */
@@ -129,6 +135,11 @@ export interface CompositionRootOptions {
     readonly taskId: string;
     readonly diffHash: string;
   }) => Promise<void>;
+  /**
+   * Dashboard 构建目录。生产环境使用 apps/web/dist；测试可注入临时目录，
+   * 从而验证静态资源服务不会越过该目录读取任意文件。
+   */
+  readonly dashboardDistPath?: string;
 }
 
 export interface CompositionRoot {
@@ -480,6 +491,17 @@ export function buildCompositionRoot(
   };
 
   const app = Fastify({ logger: false });
+  const dashboardDistPath = options.dashboardDistPath ?? resolveDashboardDistPath();
+
+  // Phase 6：Dashboard 与 API 同源提供。这样浏览器无需保存 API 地址或
+  // 凭证，SSE 也能在同源策略下自动恢复连接。只允许读取构建目录中的静态
+  // 文件；路径穿越、绝对路径和缺失的入口页一律失败关闭。
+  app.get("/dashboard", async (_req, reply) =>
+    sendDashboardAsset(reply, dashboardDistPath, "index.html", true)
+  );
+  app.get<{ Params: { "*": string } }>("/dashboard/*", async (req, reply) =>
+    sendDashboardAsset(reply, dashboardDistPath, req.params["*"], false)
+  );
 
   // 健康检查 —— 操作者用来确认 API 存活与持久化模式。
   app.get("/health", async () => ({
@@ -498,6 +520,27 @@ export function buildCompositionRoot(
     approvalPolicy: "DefaultApprovalPolicy",
     auditPolicy: "DefaultAuditPolicy"
   }));
+
+  // Phase 6：Dashboard 项目列表。这里只暴露已经登记的项目，绝不在 UI
+  // 路径上接受或探测任意本地仓库路径。
+  app.get("/projects", async () => {
+    const projects = await store.unitOfWork.run((tx) => tx.projects.findAll());
+    return { projects: sortNewestFirst(projects) };
+  });
+
+  app.get<{ Params: { projectId: string } }>("/projects/:projectId", async (req, reply) => {
+    const project = await store.unitOfWork.run((tx) => tx.projects.findById(req.params.projectId));
+    if (!project) return reply.code(404).send({ error: "项目未登记" });
+    return project;
+  });
+
+  // Dashboard 只读取项目既有任务；创建任务仍使用受校验的 POST /tasks。
+  app.get<{ Params: { projectId: string } }>("/projects/:projectId/tasks", async (req, reply) => {
+    const project = await store.unitOfWork.run((tx) => tx.projects.findById(req.params.projectId));
+    if (!project) return reply.code(404).send({ error: "项目未登记" });
+    const tasks = await store.unitOfWork.run((tx) => tx.tasks.findByProject(project.id));
+    return { tasks: sortNewestFirst(tasks) };
+  });
 
   // 创建任务 —— POST /tasks，body 为 TaskInput。
   app.post<{
@@ -522,6 +565,172 @@ export function buildCompositionRoot(
       return task;
     }
   );
+
+  // Phase 6：读取不可变 Evidence Pack 的全部版本。任务只保存当前 Pack
+  // 引用，版本集合必须由 SQLite 仓储按 Pack ID 查询，避免 UI 伪造来源。
+  app.get<{ Params: { taskId: string } }>("/tasks/:taskId/evidence-packs", async (req, reply) => {
+    const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+    if (!task) return reply.code(404).send({ error: "任务不存在" });
+    if (!task.currentEvidencePackId) return { packs: [] };
+    const packs = await store.unitOfWork.run((tx) =>
+      tx.evidencePacks.findVersions(task.currentEvidencePackId as string)
+    );
+    return { packs };
+  });
+
+  // Phase 6：Dashboard 提交的补充结论必须先形成 Evidence Request，再基于
+  // 当前 Pack 已存在的 Evidence ID 生成新版本。UI 不能直接覆写 v1，也
+  // 不能伪造任意外部 EvidenceItem；这保留了 §5.3 的不可变版本边界。
+  app.get<{ Params: { taskId: string } }>("/tasks/:taskId/evidence-requests", async (req, reply) => {
+    const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+    if (!task) return reply.code(404).send({ error: "任务不存在" });
+    const requests = await store.unitOfWork.run((tx) => tx.evidenceRequests.findByTask(task.id));
+    return { requests };
+  });
+
+  app.post<{
+    Params: { taskId: string };
+    Body: { gapReason: string; expectedPlanImpact: string };
+  }>("/tasks/:taskId/evidence-requests", async (req, reply) => {
+    try {
+      const gapReason = req.body?.gapReason?.trim();
+      const expectedPlanImpact = req.body?.expectedPlanImpact?.trim();
+      if (!gapReason || !expectedPlanImpact) {
+        return reply.code(400).send({ error: "gapReason 与 expectedPlanImpact 均为必填" });
+      }
+      const request = await orchestrator.submitEvidenceRequest({
+        taskId: req.params.taskId,
+        // Dashboard 将该请求限定为计划阶段的补充结论；不接受调用方伪造
+        // developer/reviewer 角色，以免混淆运行期 Evidence Gap 语义。
+        requesterRole: "planner",
+        gapReason,
+        neededKinds: ["code"],
+        allowedScope: "仅引用当前 Evidence Pack 中已存在的 Evidence ID",
+        expectedPlanImpact
+      });
+      return reply.code(201).send(request);
+    } catch (err) {
+      const name = (err as Error).name;
+      const message = (err as Error).message;
+      return reply.code(name === "TaskNotFoundError" ? 404 : 400).send({ error: message });
+    }
+  });
+
+  app.post<{
+    Params: { taskId: string; requestId: string };
+    Body: {
+      rootCause: Hypothesis;
+      applicabilityConditions?: readonly EvidenceConstraint[];
+    };
+  }>("/tasks/:taskId/evidence-requests/:requestId/resolve", async (req, reply) => {
+    try {
+      const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+      if (!task) return reply.code(404).send({ error: "任务不存在" });
+      if (!task.currentEvidencePackId) {
+        return reply.code(409).send({ error: "任务尚未形成 Evidence Pack，不能补充结论" });
+      }
+      const currentPack = await store.unitOfWork.run((tx) =>
+        tx.evidencePacks.findLatestVersion(task.currentEvidencePackId as string)
+      );
+      if (!currentPack) return reply.code(409).send({ error: "当前 Evidence Pack 不存在" });
+
+      const body = req.body;
+      const validationError = validateDashboardEvidenceConclusion(
+        body?.rootCause,
+        body?.applicabilityConditions,
+        currentPack.evidence.map((item) => item.id)
+      );
+      if (validationError) return reply.code(400).send({ error: validationError });
+
+      const pack = await orchestrator.evolvePackWithNewEvidence({
+        taskId: task.id,
+        requestId: req.params.requestId,
+        // 不接受网页提交新的 EvidenceItem；只为已登记证据添加可追溯的
+        // hypothesis / constraint，由 Orchestrator 创建不可变 v(n+1)。
+        additions: {
+          evidence: [],
+          hypotheses: [body.rootCause],
+          constraints: body.applicabilityConditions
+        }
+      });
+      return reply.code(201).send(pack);
+    } catch (err) {
+      const name = (err as Error).name;
+      const message = (err as Error).message;
+      const code = name === "TaskNotFoundError" ? 404 : 400;
+      return reply.code(code).send({ error: message });
+    }
+  });
+
+  // Phase 6：Diff 与验证结果只读取 runDevelop 已写入的受控产物。响应使用
+  // 预览上限，避免浏览器页面意外承载超大 patch 或完整测试日志。
+  app.get<{ Params: { taskId: string } }>("/tasks/:taskId/execution-results", async (req, reply) => {
+    const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+    if (!task) return reply.code(404).send({ error: "任务不存在" });
+    const results = await store.unitOfWork.run((tx) => tx.executionResults.findByTask(task.id));
+    return { source: "controlled-execution-results", results: results.map(toDashboardExecutionResult) };
+  });
+
+  // Phase 6：审查产物、审批记录和审计时间线均只读自 SQLite 真源，供
+  // Dashboard 分面展示。人工决定仍必须走 Phase 5 的两步挑战端点。
+  app.get<{ Params: { taskId: string } }>("/tasks/:taskId/approvals", async (req, reply) => {
+    const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+    if (!task) return reply.code(404).send({ error: "任务不存在" });
+    const approvals = await store.unitOfWork.run((tx) => tx.approvals.findByTask(task.id));
+    return { approvals };
+  });
+
+  // SSE 在连接时立即推送最新持久化状态，并仅在任务或最新审计事件变化时
+  // 再推送。连接中断后 EventSource 自动重连，会重新取得当前 SQLite 状态；
+  // 因此客户端不依赖易丢失的内存事件来恢复任务视图。
+  app.get<{ Params: { taskId: string } }>("/tasks/:taskId/events", async (req, reply) => {
+    const initialTask = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+    if (!initialTask) return reply.code(404).send({ error: "任务不存在" });
+
+    reply.hijack();
+    const raw = reply.raw;
+    raw.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer"
+    });
+    raw.write("retry: 2000\n\n");
+
+    let closed = false;
+    let lastSignature = "";
+    const publish = async (): Promise<void> => {
+      try {
+        const snapshot = await readTaskSnapshot(store.unitOfWork, req.params.taskId);
+        if (closed || !snapshot) return;
+        const signature = `${snapshot.task.updatedAt}:${snapshot.latestAudit?.id ?? ""}`;
+        if (signature === lastSignature) return;
+        lastSignature = signature;
+        raw.write(buildTaskSnapshotEvent(snapshot.task, snapshot.latestAudit));
+      } catch {
+        // 不把内部错误或路径信息发送给浏览器；浏览器会按照 retry 自动重连。
+        if (!closed) raw.write("event: stream_error\ndata: {\"error\":\"任务状态暂不可读取\"}\n\n");
+      }
+    };
+
+    await publish();
+    let lastHeartbeatAt = Date.now();
+    const timer = setInterval(() => {
+      void publish();
+      const now = Date.now();
+      // SSE 注释帧不携带任务数据，只用于让代理/浏览器及时发现半开连接。
+      if (!closed && now - lastHeartbeatAt >= 15000) {
+        raw.write(": heartbeat\n\n");
+        lastHeartbeatAt = now;
+      }
+    }, 2000);
+    req.raw.once("close", () => {
+      closed = true;
+      clearInterval(timer);
+    });
+  });
 
   // 迁移任务 —— POST /tasks/:taskId/transition，body 为 { to, reason? }。
   app.post<{
@@ -1282,6 +1491,244 @@ export function buildCompositionRoot(
     createServicesForProject,
     close
   };
+}
+
+/** Dashboard 显示的单条执行产物预览上限。完整产物仍保存在 SQLite 真源。 */
+const DASHBOARD_DIFF_PREVIEW_LIMIT = 64 * 1024;
+const DASHBOARD_OUTPUT_PREVIEW_LIMIT = 8 * 1024;
+
+/**
+ * 把受控执行产物转换成适于页面展示的只读预览。
+ *
+ * 不接受浏览器提交的 Diff 或验证结果，也不把完整大输出无上限地传到页面；
+ * Review 的可信输入仍只能通过 ExecutionOrchestrator 从该 SQLite 产物读取。
+ */
+function toDashboardExecutionResult(result: ExecutionResult) {
+  const patch = truncateDashboardText(result.diffPatch, DASHBOARD_DIFF_PREVIEW_LIMIT);
+  const stdout = truncateDashboardText(result.verificationStdout, DASHBOARD_OUTPUT_PREVIEW_LIMIT);
+  const stderr = truncateDashboardText(result.verificationStderr, DASHBOARD_OUTPUT_PREVIEW_LIMIT);
+  return {
+    id: result.id,
+    runId: result.runId,
+    createdAt: result.createdAt,
+    diff: {
+      hash: result.diffHash,
+      changedFiles: result.diffChangedFiles,
+      bytes: result.diffBytes,
+      patchPreview: patch.value,
+      truncated: patch.truncated
+    },
+    verification: {
+      exitCode: result.verificationExitCode,
+      passed: result.verificationPassed,
+      stdoutPreview: stdout.value,
+      stdoutTruncated: stdout.truncated,
+      stderrPreview: stderr.value,
+      stderrTruncated: stderr.truncated
+    }
+  };
+}
+
+function truncateDashboardText(value: string, limit: number): {
+  readonly value: string;
+  readonly truncated: boolean;
+} {
+  return value.length > limit
+    ? { value: value.slice(0, limit), truncated: true }
+    : { value, truncated: false };
+}
+
+/**
+ * 校验 Dashboard 补充结论只能引用当前 Evidence Pack 中已经存在的证据。
+ *
+ * 这只是 HTTP 边界的输入校验；真正的版本化、任务归属和 Request 归属仍由
+ * TaskOrchestrator 在同一 SQLite 事务中强制执行，二者缺一不可。
+ */
+function validateDashboardEvidenceConclusion(
+  rootCause: unknown,
+  applicabilityConditions: unknown,
+  availableEvidenceIds: readonly string[]
+): string | undefined {
+  const available = new Set(availableEvidenceIds);
+  const validateReferences = (value: unknown, field: string): string | undefined => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return `${field} 必须是对象`;
+    }
+    const item = value as Record<string, unknown>;
+    if (typeof item.text !== "string" || item.text.trim().length === 0) {
+      return `${field}.text 必须是非空字符串`;
+    }
+    if (!Array.isArray(item.evidenceIds) || item.evidenceIds.length === 0) {
+      return `${field}.evidenceIds 必须是非空数组`;
+    }
+    const ids = item.evidenceIds;
+    if (ids.some((id) => typeof id !== "string" || id.trim().length === 0)) {
+      return `${field}.evidenceIds 只能包含非空字符串`;
+    }
+    if (new Set(ids).size !== ids.length) {
+      return `${field}.evidenceIds 不得包含重复值`;
+    }
+    if (ids.some((id) => !available.has(id))) {
+      return `${field}.evidenceIds 只能引用当前 Evidence Pack 中的证据`;
+    }
+    return undefined;
+  };
+
+  const rootCauseError = validateReferences(rootCause, "rootCause");
+  if (rootCauseError) return rootCauseError;
+  const rootCauseRecord = rootCause as Record<string, unknown>;
+  if (
+    typeof rootCauseRecord.confidence !== "number" ||
+    !Number.isFinite(rootCauseRecord.confidence) ||
+    rootCauseRecord.confidence < 0 ||
+    rootCauseRecord.confidence > 1
+  ) {
+    return "rootCause.confidence 必须位于 0 到 1";
+  }
+
+  if (applicabilityConditions === undefined) return undefined;
+  if (!Array.isArray(applicabilityConditions)) {
+    return "applicabilityConditions 必须是数组";
+  }
+  for (const [index, condition] of applicabilityConditions.entries()) {
+    const error = validateReferences(condition, `applicabilityConditions[${index}]`);
+    if (error) return error;
+    const conditionRecord = condition as Record<string, unknown>;
+    if (typeof conditionRecord.required !== "boolean") {
+      return `applicabilityConditions[${index}].required 必须是布尔值`;
+    }
+  }
+  return undefined;
+}
+
+/** 以任务更新时间优先排序，避免修改 SQLite 仓储返回的原始数组。 */
+function sortNewestFirst<T extends { readonly createdAt: string; readonly updatedAt?: string }>(
+  records: readonly T[]
+): T[] {
+  return [...records].sort((left, right) => {
+    const leftAt = left.updatedAt ?? left.createdAt;
+    const rightAt = right.updatedAt ?? right.createdAt;
+    return rightAt.localeCompare(leftAt);
+  });
+}
+
+/**
+ * SSE 快照使用任务与最新审计的极简元信息。审计全文仍通过 /audit 获取，
+ * 这样一条事件不会重复携带日志、命令输出或可能较长的理由字段。
+ */
+async function readTaskSnapshot(
+  unitOfWork: UnitOfWork,
+  taskId: string
+): Promise<{ readonly task: Task; readonly latestAudit?: AuditEvent } | undefined> {
+  return unitOfWork.run(async (tx) => {
+    const task = await tx.tasks.findById(taskId);
+    if (!task) return undefined;
+    const audit = await tx.audit.findByTask(taskId);
+    return { task, latestAudit: audit[audit.length - 1] };
+  });
+}
+
+/** 导出纯序列化器，便于在不持久连接的测试中验证 SSE 首帧格式。 */
+export function buildTaskSnapshotEvent(task: Task, latestAudit?: AuditEvent): string {
+  const payload = {
+    task,
+    latestAudit: latestAudit
+      ? {
+          id: latestAudit.id,
+          type: latestAudit.type,
+          recordedAt: latestAudit.recordedAt
+        }
+      : undefined,
+    emittedAt: new Date().toISOString()
+  };
+  return `event: task_snapshot\ndata: ${JSON.stringify(payload)}\n\n`;
+}
+
+/** 解析生产环境的 Dashboard 构建目录，不依赖 process.cwd()。 */
+function resolveDashboardDistPath(): string {
+  // 源码路径为 apps/api/src，编译后为 apps/api/dist；二者向上两级都是 apps。
+  return resolve(fileDirname(import.meta.url), "..", "..", "web", "dist");
+}
+
+/**
+ * 安全发送 Dashboard 静态资源。`relative` + `isAbsolute` 同时覆盖 Windows
+ * 盘符、UNC 路径、../ 穿越和分隔符混用，任何越界路径都不触碰文件系统。
+ */
+async function sendDashboardAsset(
+  reply: FastifyReply,
+  dashboardDistPath: string,
+  requestedPath: string,
+  isEntry: boolean
+): Promise<FastifyReply> {
+  applyDashboardSecurityHeaders(reply);
+  const normalizedPath = requestedPath.replaceAll("\\", "/");
+  if (
+    normalizedPath.length === 0 ||
+    normalizedPath.includes("\0") ||
+    normalizedPath.startsWith("/")
+  ) {
+    return reply.code(400).send({ error: "Dashboard 资源路径非法" });
+  }
+
+  const absolutePath = resolve(dashboardDistPath, normalizedPath);
+  const fromRoot = relative(dashboardDistPath, absolutePath);
+  if (
+    fromRoot === "" ||
+    fromRoot === ".." ||
+    fromRoot.startsWith("../") ||
+    fromRoot.startsWith("..\\") ||
+    isAbsolute(fromRoot)
+  ) {
+    return reply.code(400).send({ error: "Dashboard 资源路径非法" });
+  }
+
+  try {
+    const content = await readFile(absolutePath);
+    return reply
+      .type(dashboardContentType(extname(absolutePath)))
+      .header("cache-control", isEntry ? "no-cache" : "public, max-age=300")
+      .send(content);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" && isEntry) {
+      return reply.code(503).send({
+        error: "Dashboard 尚未构建，请先运行 pnpm --filter @tracepilot/web build"
+      });
+    }
+    return reply.code(404).send({ error: "Dashboard 资源不存在" });
+  }
+}
+
+/** Dashboard 会输入审批凭证，因此静态响应默认限制为同源资源和连接。 */
+function applyDashboardSecurityHeaders(reply: FastifyReply): void {
+  reply
+    .header(
+      "content-security-policy",
+      "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'"
+    )
+    .header("x-content-type-options", "nosniff")
+    .header("referrer-policy", "no-referrer")
+    .header("x-frame-options", "DENY")
+    .header("permissions-policy", "geolocation=(), microphone=(), camera=()");
+}
+
+function dashboardContentType(extension: string): string {
+  switch (extension.toLowerCase()) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+      return "text/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".ico":
+      return "image/x-icon";
+    default:
+      return "application/octet-stream";
+  }
 }
 
 /**

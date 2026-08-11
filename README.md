@@ -2,7 +2,7 @@
 
 > 证据驱动的本地 Git 仓库修复平台。
 >
-> 本仓库已完成 Phase 0、Phase 1、Phase 2（SQLite、Fake 闭环与评测基准）、**Phase 3（Git 与证据）** 和 **Phase 4（真实修复闭环）** 的独立验收。Phase 4 已于 2026-08-03 由用户指定的最终独立 Reviewer 正式签发，完整证据与不可回退边界见 [`docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-4-ACCEPTANCE-REVIEW.md) 第 21 节。完整规格见 [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md)，各阶段验收结论见 [`docs/reviews/`](docs/reviews/)，开发规则见 [`AGENTS.md`](AGENTS.md)。
+> 本仓库已完成 Phase 0 至 **Phase 6（最小 Dashboard）** 的独立验收；Phase 4 于 2026-08-03、Phase 5 于 2026-08-10、Phase 6 于 2026-08-11 正式签发。Phase 6 已完成仅通过 UI 的受控演示、真实 SSE 断开/重连、frozen install 和全仓门禁，当前允许进入 Phase 7。完整结论见 [`docs/reviews/PHASE-6-ACCEPTANCE-REVIEW.md`](docs/reviews/PHASE-6-ACCEPTANCE-REVIEW.md) 第 7 节。完整规格见 [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md)，开发规则见 [`AGENTS.md`](AGENTS.md)。
 
 ## 一、项目简介
 
@@ -28,7 +28,7 @@ CREATED → INTAKING → GATHERING_EVIDENCE → PLANNED
 | 层 | 选型 |
 | --- | --- |
 | 语言 / 构建 | TypeScript strict + pnpm workspace（**Node ≥ 22**，推荐 24 LTS，见下文安装说明） |
-| API | Fastify + REST + SSE（SSE 后置阶段） |
+| API / Dashboard | Fastify + REST + SSE；React + Vite 同源 Dashboard（Phase 6 实现中） |
 | 日志 | Pino |
 | 持久化 | SQLite + Drizzle ORM（Phase 2 已接入；见 [ADR-005](docs/adr/ADR-005-sqlite-runtime.md)） |
 | Git | `LocalGitAdapter`（Phase 3 已接入；经 `ProcessRunner` + `CommandPolicy` + `PathPolicy` 治理，见 [ADR-002](docs/adr/ADR-002-worktree-and-command-safety.md)） |
@@ -50,7 +50,8 @@ tracepilot/
 │   │   ├── PHASE-2-ACCEPTANCE-REVIEW.md
 │   │   ├── PHASE-3-ACCEPTANCE-REVIEW.md  # Phase 3 独立验收报告
 │   │   ├── PHASE-4-ACCEPTANCE-REVIEW.md  # Phase 4 最终独立验收与签发报告
-│   │   └── PHASE-5-ACCEPTANCE-REVIEW.md  # Phase 5 独立验收报告（当前暂不通过）
+│   │   ├── PHASE-5-ACCEPTANCE-REVIEW.md  # Phase 5 独立验收与正式签发报告
+│   │   └── PHASE-6-ACCEPTANCE-REVIEW.md  # Phase 6 独立验收与正式签发报告
 │   └── adr/
 │       ├── ADR-001-runtime-boundary.md   # Runtime 边界决策
 │       ├── ADR-002-worktree-and-command-safety.md  # Worktree 受控根目录与命令安全（Phase 3）
@@ -65,7 +66,8 @@ tracepilot/
 │   ├── adapters/                      # LocalCommandAdapter + LocalGitAdapter + git-parsers + Fakes
 │   └── store/                         # SQLite + Drizzle schema + 迁移 + 仓储 + UnitOfWork + RuntimeEventBuffer
 └── apps/
-    └── api/                           # Fastify composition root + Pino（Phase 2 SQLite 装配）
+    ├── api/                           # Fastify composition root + Pino + Dashboard 同源入口
+    └── web/                           # React + Vite Dashboard（Phase 6 候选实现）
 ```
 
 ## 四、安装
@@ -86,11 +88,11 @@ tracepilot/
 # 确认 Node 版本（必须 v22.x 或 v24.x）
 node --version
 
-# 在项目根目录安装依赖
-pnpm install --no-frozen-lockfile
+# 在项目根目录按已提交锁文件安装依赖
+pnpm install --frozen-lockfile
 ```
 
-> Windows 上首次安装若报 `ERR_PNPM_IGNORED_BUILDS`，已在 `pnpm-workspace.yaml` 里通过 `allowBuilds: { esbuild: true, better-sqlite3: true }` 授权，正常情况会自动通过。`better-sqlite3@12` 会通过 `prebuild-install` 下载与当前 Node ABI 匹配的预编译二进制，无需本地编译工具链。
+> Windows 上首次安装若报 `ERR_PNPM_IGNORED_BUILDS`，已在 `pnpm-workspace.yaml` 里通过 `allowBuilds: { esbuild: true, better-sqlite3: true }` 授权，正常情况会自动通过。`better-sqlite3@12` 会通过 `prebuild-install` 下载与当前 Node ABI 匹配的预编译二进制，无需本地编译工具链。只有维护依赖版本并准备提交新的锁文件时，才可显式运行 `pnpm install --no-frozen-lockfile`；普通安装、构建和验收不得使用它掩盖锁文件漂移。
 
 ## 五、如何测试
 
@@ -173,6 +175,8 @@ pnpm -r run build       # 全包构建（生成 dist/）
 | `apps/api/tests/composition-root.test.ts` | API 端到端：建任务、普通非法迁移 400、安全敏感迁移 403、审计时间线与 SQLite 重启收口 |
 | `apps/api/tests/phase5-review-memory.test.ts` | 人工身份、状态旁路、最终 Diff TOCTOU 补偿与记忆来源链 |
 | `apps/api/tests/phase5-real-reviewer.test.ts` | 显式授权后，以真实临时 Git worktree、SQLite 产物和 API `/run` 验证两个真实 Omp Reviewer 阻断场景 |
+| `apps/api/tests/phase6-dashboard.test.ts` | Dashboard 受控 API 完整演示、真实 SSE 增量/断开/重连与静态安全边界 |
+| `apps/api/tests/phase6-dashboard-browser.test.ts` | 真实浏览器从任务创建到人工批准、Evidence/Plan/Diff/验证/Review/Memory 全链路 |
 
 ## 六、如何运行 API
 
@@ -191,7 +195,7 @@ pnpm --filter @tracepilot/api dev
 启动日志会显示：
 
 ```
-TracePilot composition root 已初始化 —— Phase 2 SQLite 装配
+TracePilot composition root 已初始化 —— Phase 4 OmpAdapter 装配
 TracePilot API 已监听
 ```
 
@@ -232,17 +236,51 @@ $decision.task.status
 Remove-Variable channelSecret, headers, challenge, challengePayload, decisionPayload
 ```
 
-### 6.3 API 端点
+### 6.3 Dashboard（Phase 6 候选实现）
+
+> **验收状态：已于 2026-08-11 正式通过并签发。** UI 完整受控演示、真实 SSE 断开/重连、锁文件和浏览器门禁均已由独立 Reviewer 复验通过；详见 [Phase 6 独立验收报告](docs/reviews/PHASE-6-ACCEPTANCE-REVIEW.md) 第 7 节。
+
+Dashboard 必须与 API 同源运行，不能直接把 `apps/web` 用独立静态服务器打开；这样 SSE
+断线能够自动重连，浏览器也不会把人工审批通道凭证发送到其他地址。
+
+```powershell
+# 按已提交锁文件安装并构建所有包
+pnpm install --frozen-lockfile
+pnpm -r run build
+
+# 浏览器门禁首次运行时安装 Chromium（仅下载浏览器，不调用模型）
+pnpm --filter @tracepilot/api exec playwright install chromium
+
+# 启动 API 后，在浏览器打开同源 Dashboard
+pnpm --filter @tracepilot/api start
+# 浏览器访问 http://127.0.0.1:7431/dashboard
+```
+
+页面可查看项目、任务时间线、Evidence Pack 各版本、服务端受控 Diff/验证预览、Review /
+Repair Record、审批记录和 Repair Memory。演示向导从任务创建后逐步执行受控证据收集、基于
+Evidence Request 的 Pack 升版、Plan、执行审批、外置 worktree、受控 Runtime、验证和 Review；
+每一步均需操作者点击确认。任务位于 `AWAITING_HUMAN_APPROVAL` 时，页面仍会使用 Phase 5 的
+“一次性挑战 → 最终决定”两步接口；它不能绕过审批、伪造审批人或自行把任务标记完成。
+
+### 6.4 API 端点
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查，返回 SQLite 与当前 Runtime 装配信息 |
 | GET | `/governance` | 当前生效的策略列表 |
+| GET | `/projects` | Dashboard 的已登记项目列表（不扫描本地目录） |
+| GET | `/projects/:projectId/tasks` | 项目任务列表，按最近更新时间排序 |
 | POST | `/tasks` | 创建任务，body: `{ projectId, input: TaskInput }` → 201 |
 | GET | `/tasks/:taskId` | 查任务，404 if not found |
 | POST | `/tasks/:taskId/transition` | 仅迁移普通编排状态；`EXECUTING`、人工审批态和终态等敏感目标返回 403 |
 | POST | `/tasks/:taskId/cancel` | 取消任务，body: `{ reason }` |
 | GET | `/tasks/:taskId/audit` | 该任务的审计事件时间线 |
+| GET | `/tasks/:taskId/events` | SSE 任务状态快照；断线重连后从 SQLite 重新读取当前状态 |
+| GET | `/tasks/:taskId/evidence-packs` | 当前 Evidence Pack 的不可变版本集合 |
+| GET / POST | `/tasks/:taskId/evidence-requests` | 查询或提交 Dashboard 的计划阶段证据补充请求 |
+| POST | `/tasks/:taskId/evidence-requests/:requestId/resolve` | 仅用当前 Pack 已有 Evidence ID 创建 Pack 新版本 |
+| GET | `/tasks/:taskId/execution-results` | 受控 Diff / 验证产物的限长展示预览 |
+| GET | `/tasks/:taskId/approvals` | 任务执行审批与人工决定记录 |
 | POST | `/tasks/:taskId/plan` | 保存绑定 Evidence Pack 与 `allowedPaths` 的 Plan |
 | POST | `/tasks/:taskId/approvals` | 记录执行审批；服务端计算当前 `scopeHash` |
 | POST | `/tasks/:taskId/worktrees` | 在执行审批后创建并登记外置受控 worktree |
@@ -254,8 +292,9 @@ Remove-Variable channelSecret, headers, challenge, challengePayload, decisionPay
 | POST | `/tasks/:taskId/human-approval` | 消费挑战，原子提交人工决定、Repair Record 和任务状态 |
 | GET | `/tasks/:taskId/repair-records` | 查询任务产生的全部 Repair Record 生命周期 |
 | GET | `/projects/:projectId/repair-memory` | 默认召回当前项目最多 10 条 `APPROVED` SQLite 记忆及来源定位 |
+| GET | `/dashboard` | 同源 Dashboard 静态入口；未构建时返回 503，不读取目录外文件 |
 
-### 6.4 端到端手动验证（PowerShell 示例）
+### 6.5 端到端手动验证（PowerShell 示例）
 
 ```powershell
 # 1. 健康检查
@@ -320,7 +359,7 @@ Invoke-WebRequest "http://127.0.0.1:7431/tasks/$taskId/transition" -Method POST 
 - `git worktree remove` 在 `CommandPolicy` 中默认拒绝（删除性操作）；`LocalGitAdapter.removeRegisteredWorktree` 在 `PathPolicy` 校验通过后直接调用 `ProcessRunner.run`，这是 ADR-002 的受控清理策略。
 - `FakeGitAdapter` 与 `LocalGitAdapter` 通过同一套契约测试（`git-adapter-contract.test.ts`），确保 Phase 4+ 替换时不引入回归。
 
-### Phase 5 Review、审批与 Repair Memory（实现中）
+### Phase 5 Review、审批与 Repair Memory（已验收）
 
 详见 [ADR-009](docs/adr/ADR-009-review-approval-repair-memory.md)：
 
@@ -340,4 +379,5 @@ Invoke-WebRequest "http://127.0.0.1:7431/tasks/$taskId/transition" -Method POST 
 | Phase 3 | 真实 Git worktree 创建/回收/Diff/历史/Blame、EvidenceRouter、Pack v1/v(n+1) 编排、契约测试、两个样例仓库集成测试、ADR-002 | 已独立验收通过 |
 | Phase 4 | 真实 `OmpAdapter`、受控修复/验证/Diff/Review 闭环 | 已于 2026-08-03 独立验收通过；P1 全部关闭 |
 | Phase 5 | 真实 Reviewer、Repair Memory 召回 | **已于 2026-08-10 独立验收通过并正式签发；P1 全部关闭** |
-| Phase 6+ | Dashboard、SAG（后置） | 已获准进入，尚未开始；先同步 `AGENTS.md` 阶段状态 |
+| Phase 6 | Dashboard、任务状态 SSE 恢复 | **已于 2026-08-11 独立验收通过并正式签发；P1 全部关闭** |
+| Phase 7+ | SAG（后置） | 已获准进入；仍须保持 SQLite 真源和 `KnowledgeAdapter` 边界 |

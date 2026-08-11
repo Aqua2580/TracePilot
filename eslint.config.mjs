@@ -55,5 +55,13 @@ export default tseslint.config(
       "@typescript-eslint/no-unsafe-argument": "off",
       "@typescript-eslint/no-unsafe-return": "off"
     }
+  },
+  {
+    files: ["apps/web/**/*.{ts,tsx}"],
+    languageOptions: {
+      globals: {
+        ...globals.browser
+      }
+    }
   }
 );
