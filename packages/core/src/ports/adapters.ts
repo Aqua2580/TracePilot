@@ -320,6 +320,28 @@ export interface KnowledgeAdapter {
   write(record: RepairRecord): Promise<void>;
 }
 
+/** Phase 7：SQLite 已批准 Repair Record 的最小、可追溯 SAG 投影。 */
+export interface SagMirrorPayload {
+  readonly schemaVersion: 1;
+  readonly projectId: string;
+  readonly knowledgeSourceId: string;
+  readonly repairRecordId: string;
+  readonly symptom: string;
+  readonly rootCause: string;
+  readonly fixSummary: string;
+  readonly sourceLocator: string;
+}
+
+
+/** 只允许在 SQLite 事务提交后调用；实现不得反向写入业务表。 */
+export interface SagMirrorTransport {
+  upsertRepairRecord(payload: SagMirrorPayload): Promise<void>;
+  searchRepairRecordIds(input: {
+    readonly knowledgeSourceId: string;
+    readonly query: MemoryQuery;
+  }): Promise<readonly string[]>;
+}
+
 // ---------------------------------------------------------------------------
 // ProcessRunner — §6（治理约束的子进程执行）
 // ---------------------------------------------------------------------------

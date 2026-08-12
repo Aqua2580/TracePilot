@@ -268,3 +268,18 @@ export const executionResults = sqliteTable("execution_results", {
   verificationStderr: text("verification_stderr").notNull(),
   createdAt: text("created_at").notNull()
 });
+
+/** Phase 7：SQLite 提交后的可重试 SAG 镜像队列；网络调用不在事务内发生。 */
+export const sagOutbox = sqliteTable("sag_outbox", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  repairRecordId: text("repair_record_id").notNull().references(() => repairRecords.id, { onDelete: "cascade" }),
+  payloadJson: text("payload_json").notNull(),
+  contentHash: text("content_hash").notNull(),
+  status: text("status", { enum: ["PENDING", "PROCESSING", "SENT"] }).notNull(),
+  attempts: integer("attempts").notNull(),
+  nextAttemptAt: text("next_attempt_at").notNull(),
+  lastError: text("last_error"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull()
+});

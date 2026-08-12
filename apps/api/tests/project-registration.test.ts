@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildCompositionRoot, type CompositionRoot } from "../src/composition-root.js";
 import {
+  bindProjectKnowledgeSource,
   deriveProjectId,
   ProjectRegistrationError,
   registerProject
@@ -108,5 +109,32 @@ describe("受控项目登记", () => {
       language: "typescript",
       commands: { test: { argv: ["git", "push"], timeoutMs: 300000 } }
     })).rejects.toBeInstanceOf(ProjectRegistrationError);
+  });
+
+  it("可为已登记项目绑定受限格式的本地 SAG Source，不改动固定命令", async () => {
+    const project = await registerProject(root.store, {
+      name: "待绑定 Source 的项目",
+      repositoryPath,
+      language: "typescript",
+      commands: { test: { argv: ["pnpm", "test"], timeoutMs: 300000 } }
+    });
+
+    const updated = await bindProjectKnowledgeSource(root.store, {
+      projectId: project.id,
+      knowledgeSourceId: "source:tracepilot-demo-01"
+    });
+    expect(updated).toEqual({ ...project, knowledgeSourceId: "source:tracepilot-demo-01" });
+    await expect(
+      bindProjectKnowledgeSource(root.store, {
+        projectId: project.id,
+        knowledgeSourceId: "../../越界"
+      })
+    ).rejects.toThrow("--knowledge-source-id");
+    await expect(
+      bindProjectKnowledgeSource(root.store, {
+        projectId: "missing-project",
+        knowledgeSourceId: "source:tracepilot-demo-02"
+      })
+    ).rejects.toThrow("项目不存在");
   });
 });

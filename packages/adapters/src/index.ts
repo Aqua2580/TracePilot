@@ -36,6 +36,8 @@ export {
 } from "./local-git-adapter.js";
 export { LocalWorktreeFilesystemGuard, ExecutionIsolationError } from "./local-worktree-filesystem-guard.js";
 export { LocalControlledFileWriter } from "./local-controlled-file-writer.js";
+export { SagHttpTransport, SagTransportError, type SagHttpTransportOptions } from "./sag-http-transport.js";
+export { SagKnowledgeAdapter, type SagKnowledgeAdapterOptions } from "./sag-knowledge-adapter.js";
 export {
   parseGitLog,
   parseGitBlame,

@@ -191,8 +191,13 @@ describe("SQLite 迁移", () => {
   it("首次打开数据库时应用所有迁移，版本号正确", () => {
     const db = openDatabase({ dbPath });
     const versions = getAppliedVersions(db);
-    expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
-    expect(getLatestMigrationVersion()).toBe(8);
+    const latest = getLatestMigrationVersion();
+    expect(versions).toEqual(Array.from({ length: latest }, (_, index) => index + 1));
+    expect(latest).toBe(9);
+    const columns = db.prepare("PRAGMA table_info(sag_outbox)").all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining([
+      "project_id", "repair_record_id", "payload_json", "content_hash", "status", "attempts", "next_attempt_at"
+    ]));
     closeDatabase(db);
   });
 
@@ -202,7 +207,7 @@ describe("SQLite 迁移", () => {
 
     const db2 = openDatabase({ dbPath });
     const versions = getAppliedVersions(db2);
-    expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(versions).toEqual(Array.from({ length: getLatestMigrationVersion() }, (_, index) => index + 1));
     closeDatabase(db2);
   });
 
@@ -278,7 +283,7 @@ describe("SQLite 迁移", () => {
 
     let upgraded: SqliteStore | undefined = createSqliteStore({ dbPath });
     try {
-      expect(getAppliedVersions(upgraded.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(getAppliedVersions(upgraded.db)).toEqual(Array.from({ length: getLatestMigrationVersion() }, (_, index) => index + 1));
       const migrated = upgraded.db
         .prepare(
           "SELECT id, status, failure_reasons_json FROM repair_records ORDER BY id"
@@ -354,7 +359,7 @@ describe("SQLite 迁移", () => {
 
       upgraded.close();
       upgraded = createSqliteStore({ dbPath });
-      expect(getAppliedVersions(upgraded.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(getAppliedVersions(upgraded.db)).toEqual(Array.from({ length: getLatestMigrationVersion() }, (_, index) => index + 1));
       await expect(
         upgraded.knowledgeAdapter.search({ projectId: "project-legacy" })
       ).resolves.toMatchObject([{ id: "new-approved", status: "APPROVED" }]);
@@ -419,7 +424,7 @@ describe("SQLite 迁移", () => {
 
     const latestStore = createSqliteStore({ dbPath });
     try {
-      expect(getAppliedVersions(latestStore.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(getAppliedVersions(latestStore.db)).toEqual(Array.from({ length: getLatestMigrationVersion() }, (_, index) => index + 1));
       const row = latestStore.db
         .prepare("SELECT status FROM repair_records WHERE id = ?")
         .get("approved-valid-v6") as { status: string };
@@ -499,7 +504,7 @@ describe("SQLite 迁移", () => {
 
     let latestStore: SqliteStore | undefined = createSqliteStore({ dbPath });
     try {
-      expect(getAppliedVersions(latestStore.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(getAppliedVersions(latestStore.db)).toEqual(Array.from({ length: getLatestMigrationVersion() }, (_, index) => index + 1));
       const migrated = latestStore.db
         .prepare(
           "SELECT status, failure_reasons_json FROM repair_records WHERE id = ?"
@@ -520,7 +525,7 @@ describe("SQLite 迁移", () => {
 
       latestStore.close();
       latestStore = createSqliteStore({ dbPath });
-      expect(getAppliedVersions(latestStore.db)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(getAppliedVersions(latestStore.db)).toEqual(Array.from({ length: getLatestMigrationVersion() }, (_, index) => index + 1));
       const restarted = latestStore.db
         .prepare("SELECT status FROM repair_records WHERE id = ?")
         .get("record-cross-project") as { status: string };

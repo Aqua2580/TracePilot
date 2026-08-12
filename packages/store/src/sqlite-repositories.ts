@@ -9,6 +9,7 @@
  * 管理，Repository 不自行 BEGIN/COMMIT。
  */
 
+import { createHash } from "node:crypto";
 import type { Database as DatabaseType } from "better-sqlite3";
 import type { Project, ProjectCommands, CommandSpec } from "@tracepilot/core";
 import type { Task, TaskInput, TaskStatus, ApprovalRecord, Plan, PlanNode } from "@tracepilot/core";
@@ -713,6 +714,33 @@ class SqliteRepairRecordRepository implements RepairRecordRepository {
         createdAt: record.createdAt,
         updatedAt: record.updatedAt
       });
+    this.enqueueSagMirror(record);
+  }
+
+  /** 仅为已人工批准且已绑定本地 SAG Source 的记录创建镜像任务。 */
+  private enqueueSagMirror(record: RepairRecord): void {
+    if (record.status !== "APPROVED") return;
+    const project = this.db
+      .prepare("SELECT knowledge_source_id FROM projects WHERE id = ?")
+      .get(record.projectId) as { knowledge_source_id: string | null } | undefined;
+    if (!project?.knowledge_source_id) return;
+    const payload = JSON.stringify({
+      schemaVersion: 1,
+      projectId: record.projectId,
+      knowledgeSourceId: project.knowledge_source_id,
+      repairRecordId: record.id,
+      symptom: record.symptom,
+      rootCause: record.rootCause,
+      fixSummary: record.fixSummary,
+      sourceLocator: `repair-record:${record.id};pack:${record.inputEvidencePackId}@${record.inputEvidencePackVersion};diff:${record.diffHash ?? "missing"}`
+    });
+    const contentHash = createHash("sha256").update(payload).digest("hex");
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `INSERT INTO sag_outbox (id, project_id, repair_record_id, payload_json, content_hash, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+       VALUES (@id, @projectId, @repairRecordId, @payloadJson, @contentHash, 'PENDING', 0, @now, NULL, @now, @now)
+       ON CONFLICT(repair_record_id, content_hash) DO NOTHING`
+    ).run({ id: `sag-${contentHash.slice(0, 24)}`, projectId: record.projectId, repairRecordId: record.id, payloadJson: payload, contentHash, now });
   }
 
   async findById(id: string): Promise<RepairRecord | undefined> {

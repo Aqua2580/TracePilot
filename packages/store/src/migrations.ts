@@ -301,6 +301,28 @@ const MIGRATIONS: readonly Migration[] = [
         deprecate.run(JSON.stringify(failureReasons), migratedAt, row.id);
       }
     }
+  },
+  {
+    version: 9,
+    description: "Phase 7 SAG 可重试镜像 outbox（不阻塞 SQLite 真源）",
+    sql: `
+      CREATE TABLE IF NOT EXISTS sag_outbox (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        repair_record_id TEXT NOT NULL REFERENCES repair_records(id) ON DELETE CASCADE,
+        payload_json TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        next_attempt_at TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (repair_record_id, content_hash)
+      );
+      CREATE INDEX IF NOT EXISTS idx_sag_outbox_pending
+        ON sag_outbox(status, next_attempt_at, created_at);
+    `
   }
 ];
 

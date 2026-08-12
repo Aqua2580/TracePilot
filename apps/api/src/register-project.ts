@@ -18,6 +18,7 @@ interface ParsedArgs {
   readonly repositoryPath: string;
   readonly language: ProjectLanguage;
   readonly commands: ProjectCommands;
+  readonly knowledgeSourceId?: string;
 }
 
 const HELP = `
@@ -37,6 +38,7 @@ const HELP = `
   --lint-argv        固定 lint argv 的 JSON 数组
   --typecheck-argv   固定类型检查 argv 的 JSON 数组
   --build-argv       固定构建 argv 的 JSON 数组
+  --knowledge-source-id  Phase 7 可选：本地 SAG 中已创建的项目 Source ID
   --timeout-ms       每条登记命令的超时（毫秒，默认 300000，最大 600000）
 
 限制：仓库必须干净；不接受仓库子目录、危险命令或重复登记。
@@ -79,6 +81,7 @@ function parseArgs(argv: readonly string[]): ParsedArgs | undefined {
     "--lint-argv",
     "--typecheck-argv",
     "--build-argv",
+    "--knowledge-source-id",
     "--timeout-ms"
   ]);
 
@@ -115,7 +118,10 @@ function parseArgs(argv: readonly string[]): ParsedArgs | undefined {
     name,
     repositoryPath,
     language: rawLanguage,
-    commands
+    commands,
+    ...(values.has("--knowledge-source-id")
+      ? { knowledgeSourceId: required(values, "--knowledge-source-id") }
+      : {})
   };
 }
 

@@ -269,7 +269,51 @@ pnpm --filter @tracepilot/api start
 pnpm --filter @tracepilot/api run register-project -- --help
 ```
 
-### 6.4 Dashboard（Phase 6 候选实现）
+### 6.4 Phase 7：可选本地 SAG Repair Memory 增强（候选实现）
+
+> 这不是 MVP 的启动前提。未配置 SAG 时，TracePilot 继续只使用 SQLite Repair
+> Memory，所有已验收的任务、审批和 Dashboard 流程保持可用。
+
+若已在本机运行 SAG，并在其中为某个项目**手工创建独立 Source**，可在登记时
+明确绑定该 Source ID：
+
+```powershell
+pnpm --filter @tracepilot/api run register-project -- `
+  --path "D:\agent\my-project" `
+  --name "我的项目" `
+  --language typescript `
+  --test-argv '["pnpm","test"]' `
+  --knowledge-source-id "替换为本地 SAG 的项目 Source ID"
+```
+
+已经登记的项目无需重新登记，也不用改动项目路径、分支或验证命令。先从
+Dashboard 或 `GET /projects` 取得项目 ID，再执行：
+
+```powershell
+pnpm --filter @tracepilot/api run bind-knowledge-source -- `
+  --project-id "替换为已登记项目 ID" `
+  --knowledge-source-id "替换为本地 SAG 的项目 Source ID"
+```
+
+随后仅在当前 PowerShell 窗口设置本机 SAG 配置；令牌不要写进命令历史、代码或
+Dashboard：
+
+```powershell
+$env:TRACEPILOT_SAG_BASE_URL = "http://127.0.0.1:8000/api/v1"
+$env:TRACEPILOT_SAG_TOKEN = "替换为本地 SAG token"
+pnpm --filter @tracepilot/api start
+```
+
+启用后，人工批准的 Repair Record 先照常提交 SQLite，再进入可重试 outbox 同步到
+该项目 Source。SAG 离线、超时或检索失败时不会回滚 SQLite，也不会阻断任务；检索只会
+重排 SQLite 已验证的同项目记录，不能直接把 SAG 内容作为正式证据。服务健康检查中的
+`knowledge` 会显示 `sqlite-memory` 或 `sag-enhanced`。
+
+当前候选实现尚未完成真实 SAG 跨 ADR/Issue/PR 演示、SAG 端重复投递行为验证、真实
+Omp/DAP 运行时调试证据及独立验收，不能据此宣称 Phase 7 完成。详细边界见
+[ADR-004](docs/adr/ADR-004-sag-adapter.md)。
+
+### 6.5 Dashboard（Phase 6 候选实现）
 
 > **验收状态：已于 2026-08-11 正式通过并签发。** UI 完整受控演示、真实 SSE 断开/重连、锁文件和浏览器门禁均已由独立 Reviewer 复验通过；详见 [Phase 6 独立验收报告](docs/reviews/PHASE-6-ACCEPTANCE-REVIEW.md) 第 7 节。
 
@@ -295,7 +339,7 @@ Evidence Request 的 Pack 升版、Plan、执行审批、外置 worktree、受�
 每一步均需操作者点击确认。任务位于 `AWAITING_HUMAN_APPROVAL` 时，页面仍会使用 Phase 5 的
 “一次性挑战 → 最终决定”两步接口；它不能绕过审批、伪造审批人或自行把任务标记完成。
 
-### 6.5 API 端点
+### 6.6 API 端点
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -414,4 +458,4 @@ Invoke-WebRequest "http://127.0.0.1:7431/tasks/$taskId/transition" -Method POST 
 | Phase 4 | 真实 `OmpAdapter`、受控修复/验证/Diff/Review 闭环 | 已于 2026-08-03 独立验收通过；P1 全部关闭 |
 | Phase 5 | 真实 Reviewer、Repair Memory 召回 | **已于 2026-08-10 独立验收通过并正式签发；P1 全部关闭** |
 | Phase 6 | Dashboard、任务状态 SSE 恢复 | **已于 2026-08-11 独立验收通过并正式签发；P1 全部关闭** |
-| Phase 7+ | SAG（后置） | 已获准进入；仍须保持 SQLite 真源和 `KnowledgeAdapter` 边界 |
+| Phase 7+ | SAG（后置） | 已获准进入；已实现候选 outbox/Adapter，仍须保持 SQLite 真源和 `KnowledgeAdapter` 边界，等待真实 SAG 验证与独立验收 |

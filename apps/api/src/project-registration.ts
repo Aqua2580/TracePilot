@@ -29,6 +29,8 @@ export interface ProjectRegistrationInput {
   readonly repositoryPath: string;
   readonly language: ProjectLanguage;
   readonly commands: ProjectCommands;
+  /** Phase 7：操作者在本地 SAG 中预先创建并明确绑定的项目 Source。 */
+  readonly knowledgeSourceId?: string;
 }
 
 /** 供 CLI 把可读错误返回给操作者，避免暴露未处理异常栈。 */
@@ -93,7 +95,10 @@ export async function registerProject(
     repositoryPath,
     defaultBranch: repository.defaultBranch,
     language: input.language,
-    commands: input.commands
+    commands: input.commands,
+    ...(input.knowledgeSourceId
+      ? { knowledgeSourceId: validateKnowledgeSourceId(input.knowledgeSourceId) }
+      : {})
   });
 
   await store.unitOfWork.run(async (tx) => {
@@ -149,6 +154,40 @@ function validateProjectId(value: string): string {
     throw new ProjectRegistrationError("--id 只能使用小写字母、数字和连字符，长度为 1 到 64");
   }
   return value;
+}
+
+/**
+ * 为已经受控登记的项目绑定本地 SAG Source。
+ *
+ * 该操作只更新 SQLite 中的项目配置，不访问 SAG、不会补写历史记录，也不会
+ * 改变项目的路径、分支或固定命令白名单。后续新批准的 Repair Record 才会进入
+ * 对应 Source 的异步 outbox。
+ */
+export async function bindProjectKnowledgeSource(
+  store: Pick<SqliteStore, "unitOfWork">,
+  input: { readonly projectId: string; readonly knowledgeSourceId: string }
+): Promise<Project> {
+  const projectId = input.projectId.trim();
+  if (!projectId) throw new ProjectRegistrationError("项目 ID 不能为空");
+  const knowledgeSourceId = validateKnowledgeSourceId(input.knowledgeSourceId);
+
+  return store.unitOfWork.run(async (tx) => {
+    const project = await tx.projects.findById(projectId);
+    if (!project) throw new ProjectRegistrationError("项目不存在，不能绑定 SAG Source");
+    const updated: Project = { ...project, knowledgeSourceId };
+    await tx.projects.save(updated);
+    return updated;
+  });
+}
+
+function validateKnowledgeSourceId(value: string): string {
+  const sourceId = value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sourceId)) {
+    throw new ProjectRegistrationError(
+      "--knowledge-source-id 只能使用字母、数字、点、下划线、连字符和冒号，长度为 1 到 128"
+    );
+  }
+  return sourceId;
 }
 
 function validateCommands(commands: ProjectCommands): void {

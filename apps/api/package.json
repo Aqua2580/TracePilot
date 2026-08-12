@@ -10,11 +10,13 @@
     "dev": "node --watch src/server.ts",
     "start": "node dist/server.js",
     "register-project": "node dist/register-project.js",
+    "bind-knowledge-source": "node dist/bind-knowledge-source.js",
     "test": "vitest run",
     "test:omp-real": "node -e \"process.env.TRACEPILOT_OMP_REAL_STRICT='1';require('child_process').execSync('vitest run tests/omp-real-closed-loop.test.ts',{stdio:'inherit',env:process.env})\"",
     "test:phase5-real": "node -e \"process.env.TRACEPILOT_PHASE5_REAL_STRICT='1';require('child_process').execSync('vitest run tests/phase5-real-reviewer.test.ts',{stdio:'inherit',env:process.env})\"",
     "lint": "eslint src tests",
-    "test:phase6-dashboard": "vitest run tests/phase6-dashboard.test.ts tests/phase6-dashboard-browser.test.ts"
+    "test:phase6-dashboard": "vitest run tests/phase6-dashboard.test.ts tests/phase6-dashboard-browser.test.ts",
+    "test:phase7-sag": "vitest run tests/phase7-sag.test.ts"
   },
   "dependencies": {
     "@tracepilot/core": "workspace:*",

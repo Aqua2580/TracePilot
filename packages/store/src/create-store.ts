@@ -17,11 +17,14 @@ import type { UnitOfWork, KnowledgeAdapter } from "@tracepilot/core";
 import { openDatabase, closeDatabase, type OpenDatabaseOptions } from "./sqlite-runtime.js";
 import { SqliteUnitOfWork } from "./sqlite-unit-of-work.js";
 import { SqliteRepairMemoryAdapter } from "./sqlite-repair-memory-adapter.js";
+import { SqliteSagOutbox } from "./sqlite-sag-outbox.js";
 
 export interface SqliteStore {
   readonly db: DatabaseType;
   readonly unitOfWork: UnitOfWork;
   readonly knowledgeAdapter: KnowledgeAdapter;
+  /** Phase 7：SQLite 已提交记录的 SAG 异步镜像队列。 */
+  readonly sagOutbox: SqliteSagOutbox;
   /** 关闭数据库连接。 */
   close(): void;
 }
@@ -39,11 +42,13 @@ export function createSqliteStore(
   const unitOfWork = new SqliteUnitOfWork({ db });
   // P1-04：KnowledgeAdapter 写入走 UnitOfWork 单写入队列，与任务/审计事务串行化。
   const knowledgeAdapter = new SqliteRepairMemoryAdapter({ db, unitOfWork });
+  const sagOutbox = new SqliteSagOutbox({ db, unitOfWork });
 
   return {
     db,
     unitOfWork,
     knowledgeAdapter,
+    sagOutbox,
     close: () => closeDatabase(db)
   };
 }

@@ -50,7 +50,9 @@ import {
   type EvidenceConstraint,
   type Hypothesis,
   type ExecutionResult,
-  type Task
+  type Task,
+  type KnowledgeAdapter,
+  type SagMirrorTransport
 } from "@tracepilot/core";
 import { defaultGovernancePolicies } from "@tracepilot/governance";
 import {
@@ -60,6 +62,8 @@ import {
   LocalWorktreeFilesystemGuard,
   LocalControlledFileWriter,
   OmpAdapter,
+  SagHttpTransport,
+  SagKnowledgeAdapter,
   resolveDefaultWorktreePath,
   ExecutionIsolationError
 } from "@tracepilot/adapters";
@@ -140,6 +144,8 @@ export interface CompositionRootOptions {
    * 从而验证静态资源服务不会越过该目录读取任意文件。
    */
   readonly dashboardDistPath?: string;
+  /** 仅用于测试：注入 SAG 传输替身，不能替代生产环境的本地 HTTP 配置。 */
+  readonly sagTransportOverride?: SagMirrorTransport;
 }
 
 export interface CompositionRoot {
@@ -204,7 +210,17 @@ export function buildCompositionRoot(
     options.dbPath ??
     process.env.TRACEPILOT_DB_PATH ??
     resolveDefaultDataPath();
+  const sagTransport = createSagTransport(options);
+  // 配置错误必须在打开 SQLite 前失败，避免半配置在 Windows 留下数据库文件锁。
   const store = createSqliteStore({ dbPath });
+  const knowledgeAdapter: KnowledgeAdapter = sagTransport
+    ? new SagKnowledgeAdapter({
+      sqliteMemory: store.knowledgeAdapter,
+      resolveKnowledgeSourceId: async (projectId) =>
+        store.unitOfWork.run(async (tx) => (await tx.projects.findById(projectId))?.knowledgeSourceId),
+      transport: sagTransport
+    })
+    : store.knowledgeAdapter;
   const humanDecisionFinalizationGuard: HumanDecisionFinalizationGuard = {
     async finalize<T>(input: HumanDecisionFinalizationInput<T>): Promise<T> {
       const task = await store.unitOfWork.run((tx) => tx.tasks.findById(input.taskId));
@@ -416,6 +432,17 @@ export function buildCompositionRoot(
         : "TracePilot composition root 已初始化 —— Phase 4 降级模式 LocalCommandAdapter（ADR-001 MVP 兜底）"
   );
 
+  // Phase 7：仅在本地 SAG 显式配置时启动 outbox 投递。处理器不参与任何
+  // SQLite 业务事务；失败只保留为待重试记录，绝不阻断任务完成。
+  const sagOutboxTimer = sagTransport
+    ? setInterval(() => {
+      void store.sagOutbox.processReady(sagTransport).catch((error) => {
+        logger.warn({ error: error instanceof Error ? error.message : String(error) }, "SAG outbox 本轮投递失败，将按队列重试");
+      });
+    }, 5_000)
+    : undefined;
+  sagOutboxTimer?.unref();
+
   /**
    * P1-R02：为指定项目构造受控服务集合。
    *
@@ -451,7 +478,7 @@ export function buildCompositionRoot(
     const evidenceCollector = new EvidenceCollector({
       router,
       gitAdapter,
-      knowledgeAdapter: store.knowledgeAdapter,
+      knowledgeAdapter,
       unitOfWork: store.unitOfWork,
       worktreeManager
     });
@@ -509,6 +536,7 @@ export function buildCompositionRoot(
     phase: "phase-4-omp-adapter",
     runtime: runtimeKind,
     ...(runtimeKind === "omp" ? { ompPath } : {}),
+    knowledge: sagTransport ? "sag-enhanced" : "sqlite-memory",
     store: "SQLite",
     dbPath
   }));
@@ -1448,14 +1476,14 @@ export function buildCompositionRoot(
       return reply.code(400).send({ error: "maxResults 必须是 1 到 100 的整数" });
     }
 
-    const records = await store.knowledgeAdapter.search({
+    const records = await knowledgeAdapter.search({
       projectId: project.id,
       symptom: req.query.symptom,
       rootCause: req.query.rootCause,
       maxResults: parsedMax
     });
     return {
-      source: "sqlite-memory",
+      source: sagTransport ? "sag-enhanced-sqlite-truth" : "sqlite-memory",
       records: records.map((record) => ({
         ...record,
         sourceLocator: {
@@ -1478,6 +1506,7 @@ export function buildCompositionRoot(
   void runtime;
 
   const close = async (): Promise<void> => {
+    if (sagOutboxTimer) clearInterval(sagOutboxTimer);
     await app.close();
     store.close();
   };
@@ -1491,6 +1520,18 @@ export function buildCompositionRoot(
     createServicesForProject,
     close
   };
+}
+
+/** 只有地址与令牌同时显式存在时才启用 SAG；避免半配置绕过 SQLite 基线。 */
+function createSagTransport(options: CompositionRootOptions): SagMirrorTransport | undefined {
+  if (options.sagTransportOverride) return options.sagTransportOverride;
+  const baseUrl = process.env.TRACEPILOT_SAG_BASE_URL;
+  const token = process.env.TRACEPILOT_SAG_TOKEN;
+  if (!baseUrl && !token) return undefined;
+  if (!baseUrl || !token) {
+    throw new Error("SAG 配置不完整：TRACEPILOT_SAG_BASE_URL 与 TRACEPILOT_SAG_TOKEN 必须同时设置");
+  }
+  return new SagHttpTransport({ baseUrl, token });
 }
 
 /** Dashboard 显示的单条执行产物预览上限。完整产物仍保存在 SQLite 真源。 */
