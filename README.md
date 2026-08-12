@@ -236,7 +236,40 @@ $decision.task.status
 Remove-Variable channelSecret, headers, challenge, challengePayload, decisionPayload
 ```
 
-### 6.3 Dashboard（Phase 6 候选实现）
+### 6.3 受控项目登记
+
+Dashboard 只显示已经登记到本机 SQLite 的 Git 项目，**不会扫描电脑目录**。第一次使用前，先在项目根目录构建登记命令，然后明确指定一个干净的本地 Git 仓库和固定验证命令：
+
+```powershell
+# 初次使用或更新代码后，先构建命令行入口
+pnpm -r run build
+
+# 示例：把 TracePilot 自身登记为 TypeScript 项目。
+# argv 必须是 JSON 数组，不是可拼接的 shell 字符串。
+pnpm --filter @tracepilot/api run register-project -- `
+  --path "D:\agent\TracePilot" `
+  --name "TracePilot" `
+  --language typescript `
+  --test-argv '["pnpm","test"]' `
+  --lint-argv '["pnpm","lint"]' `
+  --typecheck-argv '["pnpm","typecheck"]' `
+  --build-argv '["pnpm","build"]'
+```
+
+成功后会输出项目 ID。随后启动 API 并刷新 Dashboard，就能在左侧看到“TracePilot”，创建修复任务：
+
+```powershell
+pnpm --filter @tracepilot/api start
+# 浏览器打开 http://127.0.0.1:7431/dashboard
+```
+
+登记过程只执行受治理的只读 Git 核验，不会运行 `test`、`lint`、`typecheck` 或 `build`，也不会创建 worktree、调用模型或修改仓库。它会拒绝非 Git 仓库、仓库子目录、未提交修改、重复登记和危险命令（例如 `git push`）。查看全部参数：
+
+```powershell
+pnpm --filter @tracepilot/api run register-project -- --help
+```
+
+### 6.4 Dashboard（Phase 6 候选实现）
 
 > **验收状态：已于 2026-08-11 正式通过并签发。** UI 完整受控演示、真实 SSE 断开/重连、锁文件和浏览器门禁均已由独立 Reviewer 复验通过；详见 [Phase 6 独立验收报告](docs/reviews/PHASE-6-ACCEPTANCE-REVIEW.md) 第 7 节。
 
@@ -262,12 +295,13 @@ Evidence Request 的 Pack 升版、Plan、执行审批、外置 worktree、受�
 每一步均需操作者点击确认。任务位于 `AWAITING_HUMAN_APPROVAL` 时，页面仍会使用 Phase 5 的
 “一次性挑战 → 最终决定”两步接口；它不能绕过审批、伪造审批人或自行把任务标记完成。
 
-### 6.4 API 端点
+### 6.5 API 端点
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查，返回 SQLite 与当前 Runtime 装配信息 |
 | GET | `/governance` | 当前生效的策略列表 |
+| CLI | `register-project` | 受控登记明确指定的干净本地 Git 仓库；不扫描目录、不执行登记命令 |
 | GET | `/projects` | Dashboard 的已登记项目列表（不扫描本地目录） |
 | GET | `/projects/:projectId/tasks` | 项目任务列表，按最近更新时间排序 |
 | POST | `/tasks` | 创建任务，body: `{ projectId, input: TaskInput }` → 201 |
@@ -294,7 +328,7 @@ Evidence Request 的 Pack 升版、Plan、执行审批、外置 worktree、受�
 | GET | `/projects/:projectId/repair-memory` | 默认召回当前项目最多 10 条 `APPROVED` SQLite 记忆及来源定位 |
 | GET | `/dashboard` | 同源 Dashboard 静态入口；未构建时返回 503，不读取目录外文件 |
 
-### 6.5 端到端手动验证（PowerShell 示例）
+### 6.6 端到端手动验证（PowerShell 示例）
 
 ```powershell
 # 1. 健康检查

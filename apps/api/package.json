@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "dev": "node --watch src/server.ts",
     "start": "node dist/server.js",
+    "register-project": "node dist/register-project.js",
     "test": "vitest run",
     "test:omp-real": "node -e \"process.env.TRACEPILOT_OMP_REAL_STRICT='1';require('child_process').execSync('vitest run tests/omp-real-closed-loop.test.ts',{stdio:'inherit',env:process.env})\"",
     "test:phase5-real": "node -e \"process.env.TRACEPILOT_PHASE5_REAL_STRICT='1';require('child_process').execSync('vitest run tests/phase5-real-reviewer.test.ts',{stdio:'inherit',env:process.env})\"",
