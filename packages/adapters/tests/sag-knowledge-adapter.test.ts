@@ -332,6 +332,42 @@ describe("SagHttpTransport", () => {
     })).rejects.toMatchObject({ code: "malformed_response" } satisfies Partial<SagTransportError>);
   });
 
+  it("SAG 1.5 DocumentOut 回执按受控 Source 和文档 ID 轮询至 ready", async () => {
+    const calls: Array<{ method: string; url: string }> = [];
+    const transport = new SagHttpTransport({
+      baseUrl: "http://127.0.0.1:8000/api/v1",
+      token: "synthetic-token",
+      fetchImpl: async (input, init) => {
+        calls.push({ method: init?.method ?? "GET", url: String(input) });
+        if (init?.method === "POST") {
+          return new Response(JSON.stringify({
+            id: "document-1", source_id: "source-a", status: "pending"
+          }), { status: 201 });
+        }
+        return new Response(JSON.stringify({
+          id: "document-1", source_id: "source-a", status: "ready"
+        }), { status: 200 });
+      }
+    });
+
+    await transport.upsertSourceDocument({
+      schemaVersion: 1,
+      projectId: "project-a",
+      knowledgeSourceId: "source-a",
+      id: "adr-document-out-1",
+      kind: "adr",
+      locator: "docs/adr/document-out.md",
+      title: "DocumentOut 回执",
+      text: "合成内容",
+      contentHash: hashSagSourceDocument("合成内容")
+    });
+
+    expect(calls).toEqual([
+      { method: "POST", url: "http://127.0.0.1:8000/api/v1/sources/source-a/documents/ingest" },
+      { method: "GET", url: "http://127.0.0.1:8000/api/v1/sources/source-a/documents/document-1" }
+    ]);
+  });
+
   it("SAG 状态查询接受受控 data 包装，但仍必须达到 READY", async () => {
     const calls: Array<{ method: string; url: string }> = [];
     const transport = new SagHttpTransport({

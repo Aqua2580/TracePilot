@@ -181,9 +181,11 @@ export class SagHttpTransport implements SagMirrorTransport, SagSourceDocumentTr
     if (receipt.state === "FAILED") {
       throw new SagTransportError("http", "本机 SAG 已明确报告导入失败");
     }
-    if (!receipt.statusUrl) {
+    const initialStatusUrl = receipt.statusUrl ?? documentStatusUrl(path, receipt.documentId);
+    if (!initialStatusUrl) {
       throw new SagTransportError("malformed_response", "本机 SAG 已受理导入但未返回可轮询的文档或任务状态地址");
     }
+    receipt.statusUrl = initialStatusUrl;
     const deadline = Date.now() + INGEST_READY_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await sleep(INGEST_READY_POLL_MS);
@@ -270,6 +272,8 @@ type IngestState = "READY" | "PENDING" | "FAILED";
 
 interface IngestReceipt {
   readonly state: IngestState;
+  /** SAG 1.5+ DocumentOut 的稳定文档标识，用于受控文档状态轮询。 */
+  readonly documentId?: string;
   statusUrl?: string;
 }
 
@@ -298,14 +302,22 @@ function parseIngestReceipt(value: unknown): IngestReceipt {
   const statusUrl = nested
     .map((item) => stringField(item, "status_url") ?? stringField(item, "statusUrl") ?? stringField(item, "job_url") ?? stringField(item, "jobUrl"))
     .find((item): item is string => Boolean(item));
+  const document = nested.find((item) =>
+    Boolean(stringField(item, "id")) && Boolean(stringField(item, "source_id") ?? stringField(item, "sourceId"))
+  );
+  const documentId = document && stringField(document, "id");
   if (rawStatus && ["READY", "COMPLETED", "INDEXED", "SUCCESS", "SUCCEEDED"].includes(rawStatus)) {
-    return { state: "READY" };
+    return { state: "READY", ...(documentId ? { documentId } : {}) };
   }
   if (rawStatus && ["FAILED", "ERROR", "CANCELLED", "CANCELED"].includes(rawStatus)) {
-    return { state: "FAILED" };
+    return { state: "FAILED", ...(documentId ? { documentId } : {}) };
   }
   if (rawStatus && ["PENDING", "QUEUED", "PROCESSING", "RUNNING", "INGESTING", "INDEXING"].includes(rawStatus)) {
-    return { state: "PENDING", ...(statusUrl ? { statusUrl } : {}) };
+    return {
+      state: "PENDING",
+      ...(statusUrl ? { statusUrl } : {}),
+      ...(documentId ? { documentId } : {})
+    };
   }
   throw new SagTransportError("malformed_response", "本机 SAG 导入响应缺少可识别的文档或任务状态");
 }
@@ -333,6 +345,17 @@ function validateStatusUrl(value: string, baseUrl: URL): URL {
     throw new SagTransportError("malformed_response", "本机 SAG 返回了越出受控 API 根路径的状态地址");
   }
   return url;
+}
+
+/**
+ * SAG 1.5.x 的 ingest 回执是 DocumentOut：它给出 document id 和状态，但不
+ * 给 status_url。只有从本次受控 ingest 路径推导出的同 Source 文档地址才允许
+ * 轮询，避免把服务返回的任意 ID 拼成越权请求。
+ */
+function documentStatusUrl(ingestPath: string, documentId: string | undefined): string | undefined {
+  if (!documentId || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(documentId)) return undefined;
+  const match = /^(sources\/[^/]+)\/documents\/ingest$/.exec(ingestPath);
+  return match ? `${match[1]}/documents/${encodeURIComponent(documentId)}` : undefined;
 }
 
 function splitSourceTextWithMetadata(metadata: string, source: string): string {
