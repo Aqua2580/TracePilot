@@ -276,10 +276,30 @@ export const sagOutbox = sqliteTable("sag_outbox", {
   repairRecordId: text("repair_record_id").notNull().references(() => repairRecords.id, { onDelete: "cascade" }),
   payloadJson: text("payload_json").notNull(),
   contentHash: text("content_hash").notNull(),
-  status: text("status", { enum: ["PENDING", "PROCESSING", "SENT"] }).notNull(),
+  status: text("status", { enum: ["PENDING", "PROCESSING", "SENT", "DEAD_LETTER"] }).notNull(),
   attempts: integer("attempts").notNull(),
   nextAttemptAt: text("next_attempt_at").notNull(),
+  /** Worker 网络调用期间的短租约；到期后才能由下一轮安全恢复。 */
+  leaseExpiresAt: text("lease_expires_at"),
   lastError: text("last_error"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull()
+});
+
+/**
+ * Phase 7：本机 SAG 来源文档登记。
+ *
+ * SAG 结果必须同时匹配此表的项目、Source、类型、locator 与内容哈希，才可
+ * 作为 Evidence Pack 的候选材料；该表不替代 SQLite Repair Record 真源。
+ */
+export const sagSourceDocuments = sqliteTable("sag_source_documents", {
+  projectId: text("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  knowledgeSourceId: text("knowledge_source_id").notNull(),
+  documentId: text("document_id").notNull(),
+  kind: text("kind", { enum: ["adr", "issue", "pull_request", "repair_record"] }).notNull(),
+  locator: text("locator").notNull(),
+  title: text("title").notNull(),
+  contentHash: text("content_hash").notNull(),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull()
 });

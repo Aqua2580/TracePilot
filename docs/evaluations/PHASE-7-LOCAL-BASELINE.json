@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 2,
+  "kind": "phase7_local_retrieval_fixture",
+  "configuration": {
+    "suiteVersion": "phase2-fixed-8@2026-08-13",
+    "inputSource": "packages/store/src/benchmarks.ts#BENCHMARK_FIXTURES",
+    "inputHash": "由 pnpm --filter @tracepilot/api run evaluate:phase7 输出的 configuration.inputHash 为准",
+    "repositoryBaseline": "合成固定夹具；无真实仓库 SHA",
+    "promptVersion": "不调用模型",
+    "model": null,
+    "temperature": null,
+    "randomSeed": "确定性排序；无随机采样",
+    "adapterByGroup": {
+      "no_memory": "实际调用空 FakeKnowledgeAdapter",
+      "sqlite_memory": "实际调用已种入固定 Repair Record 的 FakeKnowledgeAdapter",
+      "sag_enhanced": "实际调用 SagKnowledgeAdapter；内存传输仅重排同项目 SQLite 真源"
+    },
+    "authorization": "不调用 Omp、本机 SAG 或外部模型"
+  },
+  "sampleCount": 8,
+  "groups": [
+    {
+      "name": "no_memory",
+      "sampleCount": 8,
+      "keyEvidenceRecallAt5": 0.0,
+      "taskClosureRate": null,
+      "patchAcceptanceRate": null,
+      "unsupportedChangeRate": null,
+      "humanInterventions": null,
+      "elapsedMs": null,
+      "tokenCost": null
+    },
+    {
+      "name": "sqlite_memory",
+      "sampleCount": 8,
+      "keyEvidenceRecallAt5": 0.625,
+      "taskClosureRate": null,
+      "patchAcceptanceRate": null,
+      "unsupportedChangeRate": null,
+      "humanInterventions": null,
+      "elapsedMs": null,
+      "tokenCost": null
+    },
+    {
+      "name": "sag_enhanced",
+      "sampleCount": 8,
+      "keyEvidenceRecallAt5": 1.0,
+      "taskClosureRate": null,
+      "patchAcceptanceRate": null,
+      "unsupportedChangeRate": null,
+      "humanInterventions": null,
+      "elapsedMs": null,
+      "tokenCost": null
+    }
+  ],
+  "limitations": [
+    "固定合成夹具，不调用真实 SAG、Omp、模型或人工审批",
+    "SAG 组是内存传输契约替身，只证明 SQLite 真源重排边界，不代表真实本机 SAG 连通性或质量",
+    "仅衡量同项目已核验来源 Recall@5，不能推断任务闭环、Patch 验收或修复质量提升",
+    "所有 null 指标均表示未测量，不表示零"
+  ]
+}

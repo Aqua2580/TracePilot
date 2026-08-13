@@ -16,7 +16,10 @@
     "test:phase5-real": "node -e \"process.env.TRACEPILOT_PHASE5_REAL_STRICT='1';require('child_process').execSync('vitest run tests/phase5-real-reviewer.test.ts',{stdio:'inherit',env:process.env})\"",
     "lint": "eslint src tests",
     "test:phase6-dashboard": "vitest run tests/phase6-dashboard.test.ts tests/phase6-dashboard-browser.test.ts",
-    "test:phase7-sag": "vitest run tests/phase7-sag.test.ts"
+    "test:phase7-sag": "vitest run tests/phase7-sag.test.ts",
+    "evaluate:phase7": "node dist/phase7-evaluation.js",
+    "test:phase7-debugpy": "node -e \"if(process.env.TRACEPILOT_PHASE7_DEBUGPY_ACK!=='1')throw new Error('必须显式设置 TRACEPILOT_PHASE7_DEBUGPY_ACK=1，并确认仅运行本机合成 debugpy 断点夹具');require('child_process').execSync('pnpm --filter @tracepilot/adapters exec vitest run tests/debugpy-runtime-evidence-adapter.test.ts && pnpm --filter @tracepilot/api exec vitest run tests/phase7-runtime-evidence.test.ts',{stdio:'inherit',env:process.env})\"",
+    "test:phase7-real": "node -e \"if(process.env.TRACEPILOT_PHASE7_REAL_ACK!=='1')throw new Error('必须显式设置 TRACEPILOT_PHASE7_REAL_ACK=1，并确认真实 Omp/SAG/模型费用边界');process.env.TRACEPILOT_OMP_REAL_STRICT='1';process.env.TRACEPILOT_PHASE7_REAL_STRICT='1';require('child_process').execSync('vitest run tests/phase7-real-resume-release.test.ts tests/omp-real-closed-loop.test.ts',{stdio:'inherit',env:process.env})\""
   },
   "dependencies": {
     "@tracepilot/core": "workspace:*",

@@ -309,9 +309,68 @@ pnpm --filter @tracepilot/api start
 重排 SQLite 已验证的同项目记录，不能直接把 SAG 内容作为正式证据。服务健康检查中的
 `knowledge` 会显示 `sqlite-memory` 或 `sag-enhanced`。
 
-当前候选实现尚未完成真实 SAG 跨 ADR/Issue/PR 演示、SAG 端重复投递行为验证、真实
-Omp/DAP 运行时调试证据及独立验收，不能据此宣称 Phase 7 完成。详细边界见
-[ADR-004](docs/adr/ADR-004-sag-adapter.md)。
+候选实现提供受保护的真实门禁：它会在用户显式授权后，运行真实 Omp 的 Python/
+JavaScript 两个受控修复任务，并核对本机 SAG 的 ADR/Issue/PR 来源、运行时
+debugpy 证据、人工挑战、Repair Record、outbox 和来源召回。当前尚未运行该门禁，
+SAG 重复投递行为和 Phase 7 独立验收也仍未完成，不能据此宣称 Phase 7 完成。详细边界
+见 [ADR-004](docs/adr/ADR-004-sag-adapter.md) 和
+[ADR-010](docs/adr/ADR-010-runtime-debug-evidence.md)。
+
+本地不消费模型费用的 Phase 7 契约门禁可运行：
+
+```powershell
+pnpm test:phase7
+```
+
+它覆盖 SAG 未配置时的 SQLite 基线、半配置失败关闭、项目隔离排序、超时回退、
+SQLite 提交后的异步投递、失败退避、崩溃恢复、死信和显式重放，以及 debugpy
+运行时证据的 loopback、工作树边界、变量脱敏和 Pack 升版。若要把真实本机
+Python/debugpy 闭环也纳入测试，先显式指定已由 `uv` 建好的解释器并确认本机
+合成断点测试：
+
+```powershell
+$env:TRACEPILOT_PHASE7_PYTHON = "C:\Users\EDY\AppData\Local\TracePilot\phase7-python\.venv\Scripts\python.exe"
+$env:TRACEPILOT_PHASE7_DEBUGPY_ACK = "1"
+pnpm test:phase7-debugpy
+```
+
+未同时设置这两个变量时，真实 debugpy 场景会明确跳过，其他 Phase 7 契约仍照常
+运行。该专项只连接本机 loopback debugpy，**不调用真实 SAG、Omp 或模型**，不能
+替代独立 Resume Release 验收。
+
+真实 Resume Release 门禁必须由用户再次明确授权后运行，它会调用两项真实 Omp
+合成任务并向操作者配置的本机 SAG Source 写入合成资料：
+
+```powershell
+$env:TRACEPILOT_PHASE7_REAL_ACK = "1"
+$env:TRACEPILOT_PHASE7_SAG_SOURCE_ID = "替换为临时 SAG Source ID"
+$env:TRACEPILOT_PHASE7_PYTHON = "C:\Users\EDY\AppData\Local\TracePilot\phase7-python\.venv\Scripts\python.exe"
+pnpm test:phase7-real
+```
+
+未设置授权变量时命令失败关闭；本轮不会自动运行它。
+
+### 6.5 Phase 7：采集本机 Python 运行时证据
+
+这是一项诊断辅助能力，不会自动修改代码或启动调试器。先在**已登记的外置
+worktree**里以本机 `debugpy` 启动一个短生命周期暂停点，再将 pytest 堆栈和本机端口
+提交给 API。服务只连接 `127.0.0.1`，只读取与堆栈同源的工作树文件，并自动脱敏
+疑似凭据变量；采集成功会生成 Evidence Request 和新的 Evidence Pack 版本。
+
+```powershell
+# 示例：在已登记 worktree 中启动本机 debugpy（端口和脚本路径按实际替换）
+uv run --python "C:\Users\EDY\AppData\Local\TracePilot\phase7-python\.venv\Scripts\python.exe" `
+  python -Xfrozen_modules=off -m debugpy --listen 127.0.0.1:5678 --wait-for-client src\runtime_fixture.py
+
+# 另一个 PowerShell 窗口：把 pytest 堆栈文本保存为文件，并请求受控采集
+$body = @{ pytestStackTrace = (Get-Content -Raw .\pytest-stack.txt); dapPort = 5678 } | ConvertTo-Json
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:7431/tasks/替换为任务ID/runtime-evidence/python" `
+  -ContentType "application/json" -Body $body
+```
+
+不得把远程主机、令牌、变量值或未登记目录传入这个接口。完整边界见
+[ADR-010](docs/adr/ADR-010-runtime-debug-evidence.md)。
 
 ### 6.5 Dashboard（Phase 6 候选实现）
 
@@ -458,4 +517,4 @@ Invoke-WebRequest "http://127.0.0.1:7431/tasks/$taskId/transition" -Method POST 
 | Phase 4 | 真实 `OmpAdapter`、受控修复/验证/Diff/Review 闭环 | 已于 2026-08-03 独立验收通过；P1 全部关闭 |
 | Phase 5 | 真实 Reviewer、Repair Memory 召回 | **已于 2026-08-10 独立验收通过并正式签发；P1 全部关闭** |
 | Phase 6 | Dashboard、任务状态 SSE 恢复 | **已于 2026-08-11 独立验收通过并正式签发；P1 全部关闭** |
-| Phase 7+ | SAG（后置） | 已获准进入；已实现候选 outbox/Adapter，仍须保持 SQLite 真源和 `KnowledgeAdapter` 边界，等待真实 SAG 验证与独立验收 |
+| Phase 7 | Resume Release：SAG、运行时调试与评测 | 已实现候选 outbox/Adapter、三组本地评测和受保护的真实门禁；尚未运行真实门禁，仍须完成 SAG 重复投递验证与独立验收 |

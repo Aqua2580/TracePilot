@@ -36,8 +36,24 @@ export {
 } from "./local-git-adapter.js";
 export { LocalWorktreeFilesystemGuard, ExecutionIsolationError } from "./local-worktree-filesystem-guard.js";
 export { LocalControlledFileWriter } from "./local-controlled-file-writer.js";
-export { SagHttpTransport, SagTransportError, type SagHttpTransportOptions } from "./sag-http-transport.js";
-export { SagKnowledgeAdapter, type SagKnowledgeAdapterOptions } from "./sag-knowledge-adapter.js";
+export {
+  DebugpyRuntimeEvidenceAdapter,
+  RuntimeDebugEvidenceError,
+  type DebugpyRuntimeEvidenceAdapterOptions
+} from "./debugpy-runtime-evidence-adapter.js";
+export {
+  SagHttpTransport,
+  SagTransportError,
+  hashSagSourceDocument,
+  type SagHttpTransportOptions,
+  type SagTransportFailureCode
+} from "./sag-http-transport.js";
+export {
+  SagKnowledgeAdapter,
+  SagKnowledgeSearchError,
+  type SagKnowledgeAdapterOptions,
+  type SagKnowledgeSearchFailureCode
+} from "./sag-knowledge-adapter.js";
 export {
   parseGitLog,
   parseGitBlame,

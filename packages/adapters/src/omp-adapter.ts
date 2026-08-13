@@ -66,6 +66,19 @@ import type {
 import { PolicyDeniedError } from "./local-command-adapter.js";
 
 /**
+ * review 阶段专用的固定系统提示。Omp v17.1.5 没有 JSON Schema 输出参数，
+ * 因此以 CLI 级固定提示配合下方严格信封解析，避免默认代码助手人格在
+ * ReviewResult 外添加说明文字或 Markdown 围栏。
+ */
+const REVIEW_SYSTEM_PROMPT = [
+  "你是 TracePilot 的独立安全审查器。",
+  "最终回复只能包含一个 <tracepilot_review_result> JSON </tracepilot_review_result> 信封。",
+  "开始字符必须是 <tracepilot_review_result>，结束字符必须是 </tracepilot_review_result>。",
+  "信封外不能有任何解释、Markdown 围栏、推理过程或其他文本。",
+  "JSON 内容必须严格满足用户消息指定的 ReviewResult schema。"
+].join("\n");
+
+/**
  * omp 二进制不可用或调用失败时抛出。
  *
  * 与 ADR-001 stub 时代的 `OmpUnavailableError` 语义一致；保留同名错误类
@@ -444,19 +457,20 @@ export class OmpAdapter implements RuntimeAdapter {
           `omp review 退出码 ${result.exitCode}：${truncateStderr(result.stderr)}`
         );
       }
-      if (result.truncated) {
-        return truncatedReviewResult(input, result);
+      // 三个阶段统一使用 JSON 事件流。review 只从 terminal assistant
+      // message_end 提取最终文本，绝不把事件头、工具事件或提示中的围栏
+      // 当成 ReviewResult 候选；无法严格解析时仍由提取器失败关闭为 block。
+      const parsed = extractReviewResult(result.stdout, input);
+      if (!result.truncated) return parsed;
+
+      // ProcessRunner 截断时保留尾部完整行。只有该尾部存在可解析的 Omp
+      // terminal assistant message，才能证明 ReviewResult 未受截断影响；
+      // 普通文本、缺少终端消息或任何 NDJSON 损坏仍失败关闭。
+      const assistantText = extractAssistantTextFromOmpNdjson(result.stdout);
+      if (assistantText.sawOmpEvent && assistantText.text !== null && !assistantText.reason) {
+        return parsed;
       }
-      // Review 使用 text 模式：Omp 只返回最终 assistant 文本，必须严格按
-      // 一个 ReviewResult JSON 解析，不再把事件流头部当作候选结果。
-      const parsed = parseReviewResultText(result.stdout, input, undefined, {
-        truncated: result.truncated,
-        originalBytes: result.originalBytes,
-        retainedBytes: result.retainedBytes,
-        outputMode: "text",
-        textSegmentCount: result.stdout.trim().length > 0 ? 1 : 0
-      });
-      return parsed;
+      return truncatedReviewResult(input, result);
     } finally {
       // §7.4 第 1 点：清理 runs 记录。
       this.runs.delete(runId);
@@ -482,7 +496,7 @@ export class OmpAdapter implements RuntimeAdapter {
   /**
    * 组装 omp argv。结构固定：
    *
-   *   <ompPath> -p --mode json|text --cwd <worktree> --no-session
+   *   <ompPath> -p --mode json --cwd <worktree> --no-session
    *              --max-time <seconds> --tools <phase-specific-tools>
    *              --approval-mode=write [--profile <name>] [--model <name>]
    *              [--add-dir <path>...] "<prompt>"
@@ -511,7 +525,7 @@ export class OmpAdapter implements RuntimeAdapter {
     const argv: string[] = [
       this.opts.ompPath,
       "-p",
-      "--mode", phase === "review" ? "text" : "json",
+      "--mode", "json",
       "--cwd", worktreePath,
       "--no-session",
       "--max-time", Math.max(1, Math.floor(timeoutMs / 1000)).toString()
@@ -532,6 +546,10 @@ export class OmpAdapter implements RuntimeAdapter {
     } else {
       // review：无需任何工具，prompt 已包含 diff 和验证结果
       argv.push("--no-tools");
+      // 固定系统提示仅用于无工具的独立审查，防止默认代码助手人格在
+      // 结构化结果外添加说明文字。--thinking=off 同时避免无用思维事件
+      // 挤占受限输出缓冲区；最终 ReviewResult 仍由模型生成并严格校验。
+      argv.push("--system-prompt", REVIEW_SYSTEM_PROMPT, "--thinking", "off");
     }
 
     // P1-R01（§9.2 执行期文件隔离）：--approval-mode=write 激活 omp CLI 级
@@ -569,8 +587,8 @@ export class OmpAdapter implements RuntimeAdapter {
    * 步骤：
    * 1. `validateOmpArgv`：等价 omp 专用 CommandPolicy，校验 argv 结构。
    *    - argv[0] 必须与 opts.ompPath 严格相等（防 PATH 注入）
-   *    - analyze/develop 必须使用 --mode json；review 使用 --mode text
-   *      只接收最终 assistant 文本；三者都必须包含 --approval-mode=write / --no-session
+   *    - 三个阶段都必须使用 --mode json；review 只从 terminal assistant
+   *      文本提取结果；三者都必须包含 --approval-mode=write / --no-session
    *    - --cwd 值必须经 PathPolicy 校验位于 allowedWorktreeRoots 内
    *    - --add-dir 每个值也必须经 PathPolicy 校验
    *    - --max-time 必须在 [1, processPolicy.timeoutMs/1000] 范围内
@@ -608,7 +626,7 @@ export class OmpAdapter implements RuntimeAdapter {
    * omp argv 结构校验（等价 CommandPolicy.decide，但针对 omp 特化）。
    *
    * 校验规则按 ADR-007 §决策 2 的固定 CLI 拓扑：
-   *   <ompPath> -p --mode json|text --cwd <path> --approval-mode=write --no-session
+   *   <ompPath> -p --mode json --cwd <path> --approval-mode=write --no-session
    *             --no-extensions --no-skills --no-rules
    *             --max-time <sec> [--profile <name>] [--model <name>]
    *             [--add-dir <path>...] "<prompt>"
@@ -641,15 +659,14 @@ export class OmpAdapter implements RuntimeAdapter {
         `argv[1] 必须是 -p 或 --print，实际 ${argv[1]}`
       );
     }
-    // analyze/develop 使用 JSON 事件流；review 使用 text 模式，避免完整事件流
-    // 超过上限后只保留头部而丢失末尾 assistant ReviewResult。
+    // 三个阶段统一使用 JSON 事件流。review 的最终结果仅从 terminal
+    // assistant message_end 提取，不接受普通文本中的任意 JSON 片段。
     const modeIdx = argv.indexOf("--mode");
     const mode = modeIdx === -1 ? undefined : argv[modeIdx + 1];
-    const isReviewTextMode = mode === "text" && argv.includes("--no-tools");
-    if (modeIdx === -1 || (mode !== "json" && !isReviewTextMode)) {
+    if (modeIdx === -1 || mode !== "json") {
       throw new OmpArgvValidationError(
         "invalid-mode",
-        "analyze/develop 必须使用 --mode json；review 必须使用 --mode text 且包含 --no-tools"
+        "analyze、develop、review 都必须使用 --mode json"
       );
     }
     // --cwd <path>，且 path 必须经 PathPolicy 校验
@@ -722,6 +739,29 @@ export class OmpAdapter implements RuntimeAdapter {
           `--tools 包含禁止的工具：${forbidden.join(", ")}。允许的工具（仅只读）：${[...allowedToolNames].join(", ")}`
         );
       }
+    }
+    // review 的结构化协议依赖固定系统提示与关闭思维输出；不得接受调用方
+    // 注入任意 system prompt，也不能允许其他阶段私自覆盖系统提示。
+    const systemPromptIdx = argv.indexOf("--system-prompt");
+    const thinkingIdx = argv.indexOf("--thinking");
+    if (hasNoTools) {
+      if (systemPromptIdx === -1 || argv[systemPromptIdx + 1] !== REVIEW_SYSTEM_PROMPT) {
+        throw new OmpArgvValidationError(
+          "invalid-review-system-prompt",
+          "review 必须使用 TracePilot 固定的结构化输出系统提示"
+        );
+      }
+      if (thinkingIdx === -1 || argv[thinkingIdx + 1] !== "off") {
+        throw new OmpArgvValidationError(
+          "invalid-review-thinking-mode",
+          "review 必须使用 --thinking off，避免思维事件挤占受限输出"
+        );
+      }
+    } else if (systemPromptIdx !== -1 || thinkingIdx !== -1) {
+      throw new OmpArgvValidationError(
+        "unexpected-review-output-flag",
+        "analyze/develop 不得注入 review 专用系统提示或 thinking 配置"
+      );
     }
     // --no-session
     if (!argv.includes("--no-session")) {
@@ -965,8 +1005,8 @@ export class OmpAdapter implements RuntimeAdapter {
   /**
    * review prompt：要求 omp 基于 diff + 验证结果输出结构化 JSON 裁决。
    *
-   * JSON schema 严格匹配 ReviewResult 接口。容错解析在 `extractReviewResult`
-   * 中实现，处理模型可能不严格输出 JSON 的情况。
+   * JSON schema 严格匹配 ReviewResult 接口。`extractReviewResult` 只从
+   * JSON 事件流的 terminal assistant 文本解析，模型格式不合规时失败关闭。
    */
   private buildReviewPrompt(input: ReviewTaskInput): string {
     const ti = input.taskInput;
@@ -978,9 +1018,9 @@ export class OmpAdapter implements RuntimeAdapter {
       "",
       "## Evidence Pack 内容（不可变来源快照）",
       "Reviewer 必须只使用以下已冻结来源；不得把未出现在 Pack 中的临时搜索或 Developer 推理当作正式证据。",
-      "```json",
+      "[EVIDENCE_PACK_JSON_BEGIN]",
       JSON.stringify(input.evidencePack, null, 2),
-      "```",
+      "[EVIDENCE_PACK_JSON_END]",
       "",
       "## 任务原始目标",
       ti.objective,
@@ -995,21 +1035,22 @@ export class OmpAdapter implements RuntimeAdapter {
       `worktree: ${input.diff.worktreePath}`,
       `hash: ${input.diff.hash}`,
       `changedFiles: ${input.diff.changedFiles.join(", ") || "（无）"}`,
-      "```diff",
+      "[DIFF_BEGIN]",
       input.diff.patch || "（空 diff）",
-      "```",
+      "[DIFF_END]",
       "",
       "## 验证结果",
-      "```json",
+      "[VERIFICATION_RESULT_JSON_BEGIN]",
       JSON.stringify(input.verificationResult, null, 2),
-      "```",
+      "[VERIFICATION_RESULT_JSON_END]",
       "",
       "## 输出要求",
-      "只输出一个 JSON 对象，不得包含任何额外文本。下面是只包含 JSON 对象内容的 schema 示例，不要复制任何包装：",
+      "最终输出必须精确为一个 <tracepilot_review_result> 信封，信封外不得有任何字符、说明或 Markdown 围栏。",
+      "信封内容必须是一个 JSON 对象。下面是 JSON 对象的 schema 示例，不要复制说明文字：",
       buildReviewResultOutputExample(),
       "confidence 字段必须是不加引号的 JSON number，取值范围为 [0,1]；required 必须是 JSON boolean true 或 false。",
       "verdict、priority、category 必须分别使用各自枚举中的一个合法值，不得输出枚举说明文本。",
-      "去除首尾空白后，首字符必须是 `{`，末字符必须是 `}`；不要输出 Markdown JSON 围栏或其他额外文本。",
+      "去除首尾空白后，首字符必须是 <tracepilot_review_result>，末字符必须是 </tracepilot_review_result>；不要输出 Markdown JSON 围栏或其他额外文本。",
       "",
       "## 评审要点",
       "1. diff 是否仅触碰 allowedPaths 白名单内的文件；",
@@ -1267,9 +1308,9 @@ function mapOmpObjectToRuntimeEvent(
 /**
  * 从 omp review 的 stdout 中提取 ReviewResult JSON。
  *
- * 生产 Review 使用 text 模式并直接接收最终 assistant 文本；本函数兼容历史
- * NDJSON 夹具与调用方的 assistant 文本提取。两条路径都只接受裸 JSON 或恰好
- * 一层完整 Markdown JSON 围栏，不从说明文字中扫描或拼接对象。
+ * 生产 Review 使用 JSON 事件流，只接收 terminal assistant 文本；本函数兼容
+ * 历史 NDJSON 夹具与本地 stub。两条路径都只接受全文裸 JSON、单层 Markdown
+ * JSON 围栏或完整 TracePilot 信封，不从说明文字中扫描或拼接对象。
  *
  * 字段校验：verdict 必须是 ship/ship_with_fixes/block；findings 数组每项
  * 必须有 priority、confidence、category 和非空 message。任何字段缺失或
@@ -1407,6 +1448,7 @@ interface ReviewTextDiagnostics extends ReviewOutputMetrics {
     | "paired_fence"
     | "opening_fence_only"
     | "closing_fence_only"
+    | "tracepilot_envelope"
     | "invalid_fence";
   readonly closingFenceOnLastLine: boolean;
   readonly objectStartsWithBrace: boolean;
@@ -1437,6 +1479,22 @@ interface NormalizedReviewText {
 
 function normalizeReviewText(text: string): NormalizedReviewText {
   const trimmed = text.trim();
+  const envelopeMatch = /^<tracepilot_review_result>\s*\r?\n?([\s\S]*?)\r?\n?<\/tracepilot_review_result>$/i.exec(trimmed);
+  if (envelopeMatch) {
+    const inner = envelopeMatch[1]?.trim() ?? "";
+    const hasNestedEnvelope = /<\/?tracepilot_review_result>/i.test(inner);
+    return {
+      text: hasNestedEnvelope ? trimmed : inner,
+      markdownFenceStart: false,
+      markdownFenceEnd: false,
+      normalizationForm: hasNestedEnvelope ? "invalid_fence" : "tracepilot_envelope",
+      closingFenceOnLastLine: false,
+      objectStartsWithBrace: inner.startsWith("{"),
+      objectEndsWithBrace: inner.endsWith("}"),
+      internalFence: false,
+      ...(hasNestedEnvelope ? { normalizationError: "markdown_fence_invalid" as const } : {})
+    };
+  }
   const markdownFenceStart = trimmed.startsWith("```");
   const markdownFenceEnd = trimmed.endsWith("```");
   const openingMatch = /^```(?:json)?[ \t]*\r?\n/i.exec(trimmed);

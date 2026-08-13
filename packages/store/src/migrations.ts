@@ -323,6 +323,36 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_sag_outbox_pending
         ON sag_outbox(status, next_attempt_at, created_at);
     `
+  },
+  {
+    version: 10,
+    description: "Phase 7 SAG 跨文档来源登记（项目隔离与可回溯 locator）",
+    sql: `
+      CREATE TABLE IF NOT EXISTS sag_source_documents (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        knowledge_source_id TEXT NOT NULL,
+        document_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        locator TEXT NOT NULL,
+        title TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, document_id),
+        UNIQUE (project_id, knowledge_source_id, kind, locator)
+      );
+      CREATE INDEX IF NOT EXISTS idx_sag_source_documents_source
+        ON sag_source_documents(project_id, knowledge_source_id, kind);
+    `
+  },
+  {
+    version: 11,
+    description: "Phase 7 SAG outbox 显式处理租约到期时间，防止并发 Worker 重复领取",
+    sql: `
+      ALTER TABLE sag_outbox ADD COLUMN lease_expires_at TEXT;
+      CREATE INDEX IF NOT EXISTS idx_sag_outbox_lease
+        ON sag_outbox(status, lease_expires_at);
+    `
   }
 ];
 

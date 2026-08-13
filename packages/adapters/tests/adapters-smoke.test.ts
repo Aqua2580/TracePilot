@@ -443,14 +443,14 @@ describe("LocalCommandAdapter（ADR-001 MVP 兜底）", () => {
 });
 
 describe("P2-02 LocalProcessRunner originalBytes 与 retainedBytes 分开统计", () => {
-  it("输出超过 maxOutputBytes 时，originalBytes > retainedBytes 且 truncated=true", async () => {
+  it("输出超过 maxOutputBytes 时，originalBytes > retainedBytes、截断并保留完整尾部", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tracepilot-p2-02-"));
     try {
       // 用 node 打印大量字符到 stdout
       const runner = new LocalProcessRunner();
       const result = await runner.run(
         {
-          argv: ["node", "-e", "process.stdout.write('a'.repeat(10000))"],
+          argv: ["node", "-e", "process.stdout.write('a'.repeat(10000) + '\\nTAIL_MARKER\\n')"],
           timeoutMs: 10000
         },
         tmpDir,
@@ -465,6 +465,8 @@ describe("P2-02 LocalProcessRunner originalBytes 与 retainedBytes 分开统计"
       expect(result.originalBytes).toBeGreaterThanOrEqual(10000);
       expect(result.retainedBytes).toBeLessThanOrEqual(1024);
       expect(result.originalBytes).toBeGreaterThan(result.retainedBytes);
+      expect(result.stdout).toContain("TAIL_MARKER");
+      expect(result.stdout.startsWith("a")).toBe(false);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

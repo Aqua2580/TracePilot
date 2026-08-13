@@ -26,21 +26,23 @@ PostgreSQL 或任何远程基础设施。
 
 ## 真实 SAG 协议
 
-Phase 7 适配 SAG v2 的 source-scoped 接口：
+Phase 7 使用本机 SAG 的 source-scoped 接口：
 
 - `POST /api/v1/sources/{sourceId}/documents/ingest`
 - `POST /api/v1/sources/{sourceId}/search`
 
-每个镜像文档都带 `tracepilot_repair_record_id`、项目 ID 和 SQLite 来源定位符，
-使搜索结果可回到 Repair Record、Evidence Pack 版本和 Diff 哈希。
+每个镜像文档都带 `tracepilot_repair_record_id`、项目 ID、来源定位符、标题和
+内容哈希。结果还必须与 SQLite `sag_source_documents` 中的项目、Source、类别、
+locator、标题和哈希完全一致，才可作为新 Evidence Pack 的候选材料。
 
 ## 未验证限制
 
 公开资料确认 source-scoped 写入与搜索，但没有为 TracePilot 当前版本提供已验证
 的文档更新/去重保证。因此 outbox 以稳定内容哈希抑制本地重复待办，语义是
 “至少一次投递”。若网络在本地发送成功后中断，真实 SAG 可能需要由其自身的
-文档标题/内容去重或运维清理处理。正式 Resume Release 演示前，独立 Reviewer
-必须针对运行中的本地 SAG 验证重复投递行为并记录实际 API 版本与结果。
+文档标题/内容去重或运维清理处理。受保护的 `pnpm test:phase7-real` 会使用两个
+真实 Omp 合成任务验证首次投递和来源召回；它不会把重复投递当作已验证。正式签发前，
+独立 Reviewer 仍必须针对运行中的本地 SAG 验证重复投递行为并记录实际 API 版本与结果。
 
 ## 后果
 

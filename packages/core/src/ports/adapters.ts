@@ -13,7 +13,7 @@ import type {
   Hypothesis,
   EvidenceConstraint
 } from "../domain/evidence.js";
-import type { EvidencePack } from "../domain/evidence.js";
+import type { EvidenceItem, EvidencePack } from "../domain/evidence.js";
 import type { TaskInput } from "../domain/task.js";
 import type { RepairRecord } from "../domain/repair-record.js";
 import type { ReviewFinding } from "../domain/repair-record.js";
@@ -264,6 +264,50 @@ export interface RuntimeAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// RuntimeDebugEvidenceAdapter — Phase 7（本机 Python DAP 只读证据）
+// ---------------------------------------------------------------------------
+
+/**
+ * Python 失败堆栈与本机 debugpy 会话的受限输入。
+ *
+ * `pytestStackTrace` 只用于在已登记 worktree 中定位 Python 源文件；
+ * Adapter 必须拒绝其中指向 worktree 外的路径。DAP 端点固定为 loopback，
+ * 不允许调用方传入远程主机或任意 DAP 请求。
+ */
+export interface PythonRuntimeDebugCaptureInput {
+  readonly worktreePath: string;
+  readonly pytestStackTrace: string;
+  /** 本机 debugpy 的 loopback 监听端口。 */
+  readonly dapPort: number;
+  /**
+   * 服务端从项目登记的测试命令取得，仅用于让运行时证据可复核；
+   * Adapter 不执行此命令。
+   */
+  readonly sourceCommand?: readonly string[];
+  /** 失败日志中归一化后的 pytest 用例定位；未取得时可以省略。 */
+  readonly testLocator?: string;
+  /**
+   * 仅由服务端请求生命周期创建。信号触发后 Adapter 必须断开本机 DAP
+   * 连接并拒绝产出 EvidenceItem；浏览器提交的对象不得作为取消控制权。
+   */
+  readonly abortSignal?: AbortSignal;
+}
+
+/**
+ * Phase 7 运行时调试证据边界。
+ *
+ * 该端口只读取一个与 pytest 堆栈同源文件的暂停帧及其局部变量，并返回
+ * 可写入新 Evidence Pack 版本的 `runtime` EvidenceItem。调用方仍必须先
+ * 提交 EvidenceRequest，再通过 TaskOrchestrator 升级 Pack；Adapter 无权
+ * 直接写 SQLite、修改任务状态或控制模型。
+ */
+export interface RuntimeDebugEvidenceAdapter {
+  capturePythonRuntimeEvidence(
+    input: PythonRuntimeDebugCaptureInput
+  ): Promise<EvidenceItem>;
+}
+
+// ---------------------------------------------------------------------------
 // KnowledgeAdapter — §6 (MVP: SqliteRepairMemoryAdapter + FakeKnowledgeAdapter)
 // ---------------------------------------------------------------------------
 
@@ -320,16 +364,134 @@ export interface KnowledgeAdapter {
   write(record: RepairRecord): Promise<void>;
 }
 
+// ---------------------------------------------------------------------------
+// KnowledgeDocumentSearchAdapter — Phase 7（SAG 跨文档来源检索）
+// ---------------------------------------------------------------------------
+
+/** Resume Release 中允许进入本地 SAG Source 的文档类别。 */
+export type KnowledgeDocumentKind = "adr" | "issue" | "pull_request" | "repair_record";
+
+/**
+ * 来源文档检索输入。
+ *
+ * `projectId` 始终由已登记项目决定，调用方不能在请求中传入任意 SAG
+ * Source ID。`abortSignal` 仅供本机 Adapter 在调用取消时立即停止等待，
+ * 不会被写入 SQLite、审计或 Evidence Pack。
+ */
+export interface KnowledgeDocumentQuery {
+  readonly projectId: string;
+  readonly query: string;
+  readonly maxResults?: number;
+  readonly kinds?: readonly KnowledgeDocumentKind[];
+  readonly abortSignal?: AbortSignal;
+}
+
+/** 已经通过项目隔离和来源字段校验的本地 SAG 命中文档。 */
+export interface KnowledgeDocument {
+  readonly id: string;
+  readonly projectId: string;
+  readonly kind: KnowledgeDocumentKind;
+  readonly locator: string;
+  readonly title: string;
+  readonly excerpt: string;
+  readonly contentHash: string;
+}
+
+export class KnowledgeDocumentQueryValidationError extends Error {
+  constructor(message: string) {
+    super(`知识来源查询无效：${message}`);
+    this.name = "KnowledgeDocumentQueryValidationError";
+  }
+}
+
+/** 所有跨文档来源检索 Adapter 共用的输入边界。 */
+export function assertKnowledgeDocumentQuery(
+  query: unknown
+): asserts query is KnowledgeDocumentQuery {
+  if (!query || typeof query !== "object" || Array.isArray(query)) {
+    throw new KnowledgeDocumentQueryValidationError("query 必须是对象");
+  }
+  const value = query as Record<string, unknown>;
+  if (typeof value.projectId !== "string" || value.projectId.trim().length === 0) {
+    throw new KnowledgeDocumentQueryValidationError("projectId 必须是非空字符串");
+  }
+  if (typeof value.query !== "string" || value.query.trim().length === 0 || value.query.length > 4_000) {
+    throw new KnowledgeDocumentQueryValidationError("query 必须是长度不超过 4000 的非空字符串");
+  }
+  if (
+    value.maxResults !== undefined &&
+    (typeof value.maxResults !== "number" ||
+      !Number.isInteger(value.maxResults) ||
+      (value.maxResults as number) < 1 ||
+      (value.maxResults as number) > 20)
+  ) {
+    throw new KnowledgeDocumentQueryValidationError("maxResults 必须是 1 到 20 的整数");
+  }
+  if (value.kinds !== undefined) {
+    if (!Array.isArray(value.kinds) || value.kinds.length === 0 || value.kinds.length > 4) {
+      throw new KnowledgeDocumentQueryValidationError("kinds 必须是 1 到 4 个文档类别");
+    }
+    const allowedKinds = new Set<KnowledgeDocumentKind>(["adr", "issue", "pull_request", "repair_record"]);
+    if (!value.kinds.every((kind) => typeof kind === "string" && allowedKinds.has(kind as KnowledgeDocumentKind))) {
+      throw new KnowledgeDocumentQueryValidationError("kinds 包含不支持的文档类别");
+    }
+  }
+}
+
+/**
+ * 可选的跨文档检索能力。
+ *
+ * SQLite 的 Repair Record 仍由 `KnowledgeAdapter.search()` 返回；此接口只
+ * 返回 SAG 中带项目归属和 locator 的来源材料。未配置 SAG 的实现不具备该
+ * 接口，调用方必须以 SQLite 基线继续工作。
+ */
+export interface KnowledgeDocumentSearchAdapter {
+  searchSourceDocuments(query: KnowledgeDocumentQuery): Promise<readonly KnowledgeDocument[]>;
+}
+
+/** 用于在不破坏 SQLite/Fake 既有契约的前提下识别可选 SAG 能力。 */
+export function isKnowledgeDocumentSearchAdapter(
+  adapter: KnowledgeAdapter
+): adapter is KnowledgeAdapter & KnowledgeDocumentSearchAdapter {
+  return "searchSourceDocuments" in adapter &&
+    typeof (adapter as Partial<KnowledgeDocumentSearchAdapter>).searchSourceDocuments === "function";
+}
+
 /** Phase 7：SQLite 已批准 Repair Record 的最小、可追溯 SAG 投影。 */
 export interface SagMirrorPayload {
   readonly schemaVersion: 1;
   readonly projectId: string;
   readonly knowledgeSourceId: string;
   readonly repairRecordId: string;
+  /** 对应本机 SAG 文档正文的稳定 SHA-256，供来源登记与回溯校验。 */
+  readonly contentHash: string;
   readonly symptom: string;
   readonly rootCause: string;
   readonly fixSummary: string;
   readonly sourceLocator: string;
+}
+
+/** 写入本地 SAG 的受控来源文档；仅用于合成验收资料和已审核镜像。 */
+export interface SagSourceDocument {
+  readonly schemaVersion: 1;
+  readonly projectId: string;
+  readonly knowledgeSourceId: string;
+  readonly id: string;
+  readonly kind: KnowledgeDocumentKind;
+  readonly locator: string;
+  readonly title: string;
+  readonly text: string;
+  readonly contentHash: string;
+}
+
+/** 本地 SAG Source-scoped 搜索输入。 */
+export interface SagSourceDocumentSearchInput {
+  readonly projectId: string;
+  readonly knowledgeSourceId: string;
+  readonly query: string;
+  readonly maxResults: number;
+  readonly kinds?: readonly KnowledgeDocumentKind[];
+  readonly abortSignal?: AbortSignal;
 }
 
 
@@ -337,9 +499,19 @@ export interface SagMirrorPayload {
 export interface SagMirrorTransport {
   upsertRepairRecord(payload: SagMirrorPayload): Promise<void>;
   searchRepairRecordIds(input: {
+    /** 用于拒绝同一 Source 内的跨项目伪造元数据。 */
+    readonly projectId: string;
     readonly knowledgeSourceId: string;
     readonly query: MemoryQuery;
   }): Promise<readonly string[]>;
+}
+
+/** 本地 SAG 的跨文档来源检索与受控导入能力。 */
+export interface SagSourceDocumentTransport {
+  upsertSourceDocument(document: SagSourceDocument): Promise<void>;
+  searchSourceDocuments(
+    input: SagSourceDocumentSearchInput
+  ): Promise<readonly KnowledgeDocument[]>;
 }
 
 // ---------------------------------------------------------------------------

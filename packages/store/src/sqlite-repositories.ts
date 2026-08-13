@@ -719,23 +719,66 @@ class SqliteRepairRecordRepository implements RepairRecordRepository {
 
   /** 仅为已人工批准且已绑定本地 SAG Source 的记录创建镜像任务。 */
   private enqueueSagMirror(record: RepairRecord): void {
-    if (record.status !== "APPROVED") return;
+    if (record.status !== "APPROVED") {
+      // 已撤销/弃用的 Repair Record 不应继续作为 SAG 跨文档来源被召回。
+      // 已领取的事件仍会由 Worker 的资格复核丢弃，避免事务内网络操作。
+      this.db.prepare(
+        "DELETE FROM sag_source_documents WHERE project_id = ? AND document_id = ? AND kind = 'repair_record'"
+      ).run(record.projectId, record.id);
+      return;
+    }
     const project = this.db
       .prepare("SELECT knowledge_source_id FROM projects WHERE id = ?")
       .get(record.projectId) as { knowledge_source_id: string | null } | undefined;
     if (!project?.knowledge_source_id) return;
+    const sourceLocator = `repair-record:${record.id};pack:${record.inputEvidencePackId}@${record.inputEvidencePackVersion};diff:${record.diffHash ?? "missing"}`;
+    const documentContentHash = `sha256-${createHash("sha256")
+      .update(JSON.stringify({
+        schemaVersion: 1,
+        projectId: record.projectId,
+        knowledgeSourceId: project.knowledge_source_id,
+        repairRecordId: record.id,
+        symptom: record.symptom,
+        rootCause: record.rootCause,
+        fixSummary: record.fixSummary,
+        sourceLocator
+      }))
+      .digest("hex")}`;
     const payload = JSON.stringify({
       schemaVersion: 1,
       projectId: record.projectId,
       knowledgeSourceId: project.knowledge_source_id,
       repairRecordId: record.id,
+      contentHash: documentContentHash,
       symptom: record.symptom,
       rootCause: record.rootCause,
       fixSummary: record.fixSummary,
-      sourceLocator: `repair-record:${record.id};pack:${record.inputEvidencePackId}@${record.inputEvidencePackVersion};diff:${record.diffHash ?? "missing"}`
+      sourceLocator
     });
     const contentHash = createHash("sha256").update(payload).digest("hex");
     const now = new Date().toISOString();
+    // 与 Repair Record/outbox 同一 UnitOfWork 事务：若任何一项失败，SQLite
+    // 真源、可验证来源登记和待发送事件会一起回滚，避免出现无法回溯的镜像。
+    this.db.prepare(
+      `INSERT INTO sag_source_documents
+        (project_id, knowledge_source_id, document_id, kind, locator, title, content_hash, created_at, updated_at)
+       VALUES (@projectId, @knowledgeSourceId, @documentId, 'repair_record', @locator, @title, @contentHash, @now, @now)
+       ON CONFLICT(project_id, document_id) DO UPDATE SET
+         knowledge_source_id = @knowledgeSourceId,
+         kind = 'repair_record',
+         locator = @locator,
+         title = @title,
+         content_hash = @contentHash,
+         updated_at = @now`
+    ).run({
+      projectId: record.projectId,
+      knowledgeSourceId: project.knowledge_source_id,
+      documentId: record.id,
+      locator: sourceLocator,
+      title: `TracePilot Repair Record ${record.id}`,
+      contentHash: documentContentHash,
+      now
+    });
     this.db.prepare(
       `INSERT INTO sag_outbox (id, project_id, repair_record_id, payload_json, content_hash, status, attempts, next_attempt_at, last_error, created_at, updated_at)
        VALUES (@id, @projectId, @repairRecordId, @payloadJson, @contentHash, 'PENDING', 0, @now, NULL, @now, @now)

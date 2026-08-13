@@ -52,7 +52,13 @@ import {
   type ExecutionResult,
   type Task,
   type KnowledgeAdapter,
-  type SagMirrorTransport
+  type SagMirrorTransport,
+  type RuntimeDebugEvidenceAdapter,
+  type KnowledgeDocumentKind,
+  type KnowledgeDocument,
+  type SagSourceDocument,
+  type SagSourceDocumentTransport,
+  isKnowledgeDocumentSearchAdapter
 } from "@tracepilot/core";
 import { defaultGovernancePolicies } from "@tracepilot/governance";
 import {
@@ -62,8 +68,12 @@ import {
   LocalWorktreeFilesystemGuard,
   LocalControlledFileWriter,
   OmpAdapter,
+  DebugpyRuntimeEvidenceAdapter,
+  hashSagSourceDocument,
   SagHttpTransport,
   SagKnowledgeAdapter,
+  SagKnowledgeSearchError,
+  SagTransportError,
   resolveDefaultWorktreePath,
   ExecutionIsolationError
 } from "@tracepilot/adapters";
@@ -145,7 +155,12 @@ export interface CompositionRootOptions {
    */
   readonly dashboardDistPath?: string;
   /** 仅用于测试：注入 SAG 传输替身，不能替代生产环境的本地 HTTP 配置。 */
-  readonly sagTransportOverride?: SagMirrorTransport;
+  readonly sagTransportOverride?: SagMirrorTransport & Partial<SagSourceDocumentTransport>;
+  /**
+   * 仅用于测试：替换本机 debugpy 只读证据 Adapter。
+   * 生产环境始终使用只允许 127.0.0.1 的真实 Adapter。
+   */
+  readonly runtimeDebugEvidenceAdapterOverride?: RuntimeDebugEvidenceAdapter;
 }
 
 export interface CompositionRoot {
@@ -218,7 +233,9 @@ export function buildCompositionRoot(
       sqliteMemory: store.knowledgeAdapter,
       resolveKnowledgeSourceId: async (projectId) =>
         store.unitOfWork.run(async (tx) => (await tx.projects.findById(projectId))?.knowledgeSourceId),
-      transport: sagTransport
+      transport: sagTransport,
+      isRegisteredSourceDocument: (projectId, knowledgeSourceId, document) =>
+        store.sagSourceDocuments.verify(projectId, knowledgeSourceId, document)
     })
     : store.knowledgeAdapter;
   const humanDecisionFinalizationGuard: HumanDecisionFinalizationGuard = {
@@ -241,6 +258,9 @@ export function buildCompositionRoot(
   });
   const policies = defaultGovernancePolicies();
   const router = new EvidenceRouter();
+  const runtimeDebugEvidenceAdapter =
+    options.runtimeDebugEvidenceAdapterOverride ??
+    new DebugpyRuntimeEvidenceAdapter({ pathPolicy: policies.path });
 
   // P1-02：解析唯一受控 worktree 根目录（ADR-002）。
   // 不再使用 Phase 2 的占位 TRACEPILOT_ALLOWED_ROOTS 方案。
@@ -434,6 +454,11 @@ export function buildCompositionRoot(
 
   // Phase 7：仅在本地 SAG 显式配置时启动 outbox 投递。处理器不参与任何
   // SQLite 业务事务；失败只保留为待重试记录，绝不阻断任务完成。
+  if (sagTransport) {
+    void store.sagOutbox.processReady(sagTransport).catch((error) => {
+      logger.warn({ error: error instanceof Error ? error.message : String(error) }, "SAG outbox 启动恢复失败，将由后续轮询重试");
+    });
+  }
   const sagOutboxTimer = sagTransport
     ? setInterval(() => {
       void store.sagOutbox.processReady(sagTransport).catch((error) => {
@@ -690,6 +715,91 @@ export function buildCompositionRoot(
     }
   });
 
+  /**
+   * Phase 7：受控采集本机 Python debugpy 运行时证据。
+   *
+   * 端点不接受任意 EvidenceItem、主机地址或变量值；只接收 pytest 堆栈与
+   * loopback 端口。Adapter 将堆栈路径限定到任务已登记 worktree，随后本
+   * 服务自动创建 runtime EvidenceRequest 并用新证据生成 Pack v(n+1)。
+   */
+  app.post<{
+    Params: { taskId: string };
+    Body: { pytestStackTrace: string; dapPort: number; abortSignal?: unknown };
+  }>("/tasks/:taskId/runtime-evidence/python", async (req, reply) => {
+    try {
+      const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+      if (!task) return reply.code(404).send({ error: "任务不存在" });
+      if (!task.currentEvidencePackId) {
+        return reply.code(409).send({ error: "任务尚未形成 Evidence Pack，不能写入运行时证据" });
+      }
+      if (task.status !== "GATHERING_EVIDENCE") {
+        return reply.code(409).send({ error: "运行时证据只能在 GATHERING_EVIDENCE 状态采集；执行中的任务须先走 Evidence Gap 回环" });
+      }
+      if (!task.worktreeId) {
+        return reply.code(409).send({ error: "任务尚未登记受控 worktree，拒绝读取调试会话" });
+      }
+      const pytestStackTrace = req.body?.pytestStackTrace?.trim();
+      if (!pytestStackTrace) {
+        return reply.code(400).send({ error: "pytestStackTrace 必须是非空字符串" });
+      }
+      if (!Number.isInteger(req.body?.dapPort)) {
+        return reply.code(400).send({ error: "dapPort 必须是整数" });
+      }
+      // HTTP 请求体不能传入 AbortSignal；取消调试会话必须由服务端受控超时、
+      // 连接关闭或后续专用取消通道处理，避免浏览器伪造运行时控制对象。
+      if (req.body && "abortSignal" in req.body) {
+        return reply.code(400).send({ error: "不接受调用方提供 abortSignal" });
+      }
+      const worktree = await store.unitOfWork.run((tx) => tx.worktrees.findById(task.worktreeId as string));
+      if (!worktree || worktree.taskId !== task.id) {
+        return reply.code(409).send({ error: "任务 worktree 登记不存在或归属不一致" });
+      }
+      const project = await store.unitOfWork.run((tx) => tx.projects.findById(task.projectId));
+      if (!project) {
+        return reply.code(409).send({ error: "任务所属项目不存在，不能确定受控测试命令" });
+      }
+
+      // Request 在采集前持久化，确保 DAP 临时结果不会绕过 Pack 版本边界。
+      const request = await orchestrator.submitEvidenceRequest({
+        taskId: task.id,
+        requesterRole: "planner",
+        gapReason: "需要从 pytest 堆栈对应的本机暂停帧读取局部变量",
+        neededKinds: ["runtime"],
+        allowedScope: `已登记 worktree 内 Python 文件；仅 127.0.0.1:${req.body.dapPort} 的 debugpy 只读会话`,
+        expectedPlanImpact: "将带来源的运行时变量证据追加到新的 Evidence Pack 版本"
+      });
+      // 取消信号只能由本次 HTTP 请求的生命周期生成，浏览器请求体不得传入
+      // 可控 AbortSignal。连接断开后 DAP 适配器会立刻关闭本机 socket。
+      const captureAbortController = new AbortController();
+      const abortCapture = () => captureAbortController.abort();
+      req.raw.once("close", abortCapture);
+      let evidence;
+      try {
+        evidence = await runtimeDebugEvidenceAdapter.capturePythonRuntimeEvidence({
+          worktreePath: worktree.path,
+          pytestStackTrace,
+          dapPort: req.body.dapPort,
+          sourceCommand: project.commands.test.argv,
+          testLocator: task.input.failure?.testNames?.join(", "),
+          abortSignal: captureAbortController.signal
+        });
+      } finally {
+        req.raw.removeListener("close", abortCapture);
+      }
+      const pack = await orchestrator.evolvePackWithNewEvidence({
+        taskId: task.id,
+        requestId: request.id,
+        additions: { evidence: [evidence] }
+      });
+      return reply.code(201).send({ request, pack, evidence });
+    } catch (err) {
+      const name = (err as Error).name;
+      const message = (err as Error).message;
+      const code = name === "TaskNotFoundError" ? 404 : 400;
+      return reply.code(code).send({ error: message });
+    }
+  });
+
   // Phase 6：Diff 与验证结果只读取 runDevelop 已写入的受控产物。响应使用
   // 预览上限，避免浏览器页面意外承载超大 patch 或完整测试日志。
   app.get<{ Params: { taskId: string } }>("/tasks/:taskId/execution-results", async (req, reply) => {
@@ -763,9 +873,13 @@ export function buildCompositionRoot(
   // 迁移任务 —— POST /tasks/:taskId/transition，body 为 { to, reason? }。
   app.post<{
     Params: { taskId: string };
-    Body: { to: TaskStatus; reason?: string };
+    Body: { to: TaskStatus; reason?: string; widenScope?: boolean };
   }>("/tasks/:taskId/transition", async (req, reply) => {
-    const { to, reason } = req.body ?? ({} as { to: TaskStatus; reason?: string });
+    const { to, reason, widenScope } = req.body ?? ({} as {
+      to: TaskStatus;
+      reason?: string;
+      widenScope?: boolean;
+    });
     if (!to) return reply.code(400).send({ error: "to 为必填" });
     const publicTransitionTargets = new Set<TaskStatus>([
       "INTAKING",
@@ -781,11 +895,20 @@ export function buildCompositionRoot(
         error: `公开 transition 端点禁止进入安全敏感状态 ${to}`
       });
     }
+    // 只有执行阶段的 Evidence Gap 回到证据收集时可以声明扩大范围。该标记
+    // 会在 Core 同一事务内失效旧执行审批；其他迁移一律拒绝携带它，避免
+    // 浏览器把任意状态迁移伪装为审批失效或范围扩大。
+    if (widenScope !== undefined && typeof widenScope !== "boolean") {
+      return reply.code(400).send({ error: "widenScope 必须是布尔值" });
+    }
+    if (widenScope && to !== "GATHERING_EVIDENCE") {
+      return reply.code(400).send({ error: "widenScope 只允许用于返回 GATHERING_EVIDENCE" });
+    }
     try {
       const updated = await orchestrator.transitionTask(
         req.params.taskId,
         to,
-        { reason }
+        { reason, ...(widenScope ? { widenScope: true } : {}) }
       );
       return updated;
     } catch (err) {
@@ -1501,6 +1624,179 @@ export function buildCompositionRoot(
     };
   });
 
+  /**
+   * Phase 7：登记操作者明确提供的本机 SAG 合成来源资料。
+   *
+   * 该入口不读取本地任意文件、不创建 Source、不触发模型；只在已登记项目
+   * 已绑定的 Source 中导入有限文本，并把项目/类型/locator/哈希登记到
+   * SQLite，供后续检索结果的反向校验使用。
+   */
+  app.post<{
+    Params: { projectId: string };
+    Body: {
+      id: string;
+      kind: KnowledgeDocumentKind;
+      locator: string;
+      title: string;
+      text: string;
+      contentHash?: string;
+    };
+  }>("/projects/:projectId/sag-source-documents", async (req, reply) => {
+    if (!sagTransport || !isSagSourceDocumentTransport(sagTransport)) {
+      return reply.code(503).send({ error: "本机 SAG 跨文档能力未配置" });
+    }
+    const project = await store.unitOfWork.run((tx) => tx.projects.findById(req.params.projectId));
+    if (!project) return reply.code(404).send({ error: "项目未登记" });
+    if (!project.knowledgeSourceId) {
+      return reply.code(409).send({ error: "项目尚未绑定本机 SAG Source" });
+    }
+    const body = req.body;
+    const existingDocument = store.sagSourceDocuments.list(project.id).find((item) =>
+      item.documentId !== String(body?.id ?? "").trim() &&
+      item.kind === body?.kind &&
+      item.locator === String(body?.locator ?? "").trim()
+    );
+    if (existingDocument) {
+      return reply.code(409).send({ error: "该项目中已有同类别和 locator 的 SAG 来源登记" });
+    }
+    const document: SagSourceDocument = {
+      schemaVersion: 1,
+      projectId: project.id,
+      knowledgeSourceId: project.knowledgeSourceId,
+      id: String(body?.id ?? "").trim(),
+      kind: body?.kind,
+      locator: String(body?.locator ?? "").trim(),
+      title: String(body?.title ?? "").trim(),
+      text: String(body?.text ?? "").trim(),
+      contentHash: hashSagSourceDocument(String(body?.text ?? "").trim())
+    };
+    try {
+      const suppliedHash = body?.contentHash?.trim();
+      if (suppliedHash && suppliedHash !== document.contentHash) {
+        return reply.code(400).send({ error: "contentHash 必须等于正文的 SHA-256，或省略后由服务端生成" });
+      }
+      await sagTransport.upsertSourceDocument(document);
+      const now = new Date().toISOString();
+      await store.sagSourceDocuments.register({
+        projectId: document.projectId,
+        knowledgeSourceId: document.knowledgeSourceId,
+        documentId: document.id,
+        kind: document.kind,
+        locator: document.locator,
+        title: document.title,
+        contentHash: document.contentHash,
+        createdAt: now,
+        updatedAt: now
+      });
+      return reply.code(201).send({
+        document: {
+          id: document.id,
+          projectId: document.projectId,
+          kind: document.kind,
+          locator: document.locator,
+          title: document.title,
+          contentHash: document.contentHash
+        }
+      });
+    } catch (error) {
+      return reply.code(400).send({ error: publicSagErrorMessage(error) });
+    }
+  });
+
+  /** Phase 7：只读列出 SQLite 已登记、可被本机 SAG 返回的来源材料。 */
+  app.get<{ Params: { projectId: string } }>("/projects/:projectId/sag-source-documents", async (req, reply) => {
+    const project = await store.unitOfWork.run((tx) => tx.projects.findById(req.params.projectId));
+    if (!project) return reply.code(404).send({ error: "项目未登记" });
+    return { source: "sqlite-sag-source-registry", documents: store.sagSourceDocuments.list(project.id) };
+  });
+
+  /**
+   * Phase 7：只允许显式重放一条已存在的 outbox 事件；该入口本身不触发
+   * 网络调用，后续仍由同一受限 Worker 领取、资格复核和投递。
+   */
+  app.post<{ Params: { eventId: string } }>("/sag-outbox/:eventId/replay", async (req, reply) => {
+    try {
+      const replayed = await store.sagOutbox.replay(req.params.eventId);
+      if (!replayed) return reply.code(409).send({ error: "事件不存在，或当前状态不允许重放" });
+      return reply.code(202).send({ eventId: req.params.eventId, status: "PENDING" });
+    } catch {
+      return reply.code(400).send({ error: "SAG outbox 事件 ID 非法" });
+    }
+  });
+
+  /**
+   * Phase 7：从本地 SAG 查询已登记跨文档来源，并经 Evidence Request 生成
+   * 新 Pack 版本。SAG 返回结果不能原地注入 Pack，也不能越过工作树、计划
+   * 或审批边界。
+   */
+  app.post<{
+    Params: { taskId: string };
+    Body: { query: string; kinds?: KnowledgeDocumentKind[]; maxResults?: number; abortSignal?: unknown };
+  }>("/tasks/:taskId/sag-source-evidence", async (req, reply) => {
+    try {
+      const task = await store.unitOfWork.run((tx) => tx.tasks.findById(req.params.taskId));
+      if (!task) return reply.code(404).send({ error: "任务不存在" });
+      if (task.status !== "GATHERING_EVIDENCE" || !task.currentEvidencePackId) {
+        return reply.code(409).send({ error: "SAG 来源证据只能在已有 Pack 的 GATHERING_EVIDENCE 状态采集" });
+      }
+      const project = await store.unitOfWork.run((tx) => tx.projects.findById(task.projectId));
+      if (!project) return reply.code(409).send({ error: "任务项目不存在" });
+      if (!isKnowledgeDocumentSearchAdapter(knowledgeAdapter)) {
+        return reply.code(503).send({ error: "本机 SAG 跨文档能力未配置" });
+      }
+      const query = req.body?.query?.trim();
+      if (!query) return reply.code(400).send({ error: "query 必须是非空字符串" });
+      // HTTP 请求体不能传入 AbortSignal。检索取消权只能随本次服务端请求的
+      // 生命周期下传，避免客户端伪造控制对象或把不可序列化对象写入审计边界。
+      if (req.body && "abortSignal" in req.body) {
+        return reply.code(400).send({ error: "不接受调用方提供 abortSignal" });
+      }
+      const request = await orchestrator.submitEvidenceRequest({
+        taskId: task.id,
+        requesterRole: "planner",
+        gapReason: "需要检索已登记的 ADR、Issue、PR 或 Repair Record 来源",
+        neededKinds: ["memory"],
+        allowedScope: `项目 ${project.id} 已绑定的本机 SAG Source；仅已登记跨文档来源`,
+        expectedPlanImpact: "将可回溯的跨文档来源摘要追加到新的 Evidence Pack 版本"
+      });
+      const searchAbortController = new AbortController();
+      const abortSearch = () => searchAbortController.abort();
+      req.raw.once("close", abortSearch);
+      let documents: readonly KnowledgeDocument[];
+      try {
+        documents = await knowledgeAdapter.searchSourceDocuments({
+          projectId: project.id,
+          query,
+          maxResults: req.body?.maxResults,
+          kinds: req.body?.kinds,
+          abortSignal: searchAbortController.signal
+        });
+      } finally {
+        req.raw.removeListener("close", abortSearch);
+      }
+      const capturedAt = new Date().toISOString();
+      const evidence = documents.map((document) => ({
+        id: `sag-source-${document.id}`,
+        kind: "memory" as const,
+        source: `sag-${document.kind}`,
+        locator: document.locator,
+        capturedAt,
+        contentHash: document.contentHash,
+        summary: `${document.title}：${document.excerpt}`.slice(0, 2_500),
+        relevance: 0.75,
+        trustLevel: "UNVERIFIED" as const
+      }));
+      const pack = await orchestrator.evolvePackWithNewEvidence({
+        taskId: task.id,
+        requestId: request.id,
+        additions: { evidence }
+      });
+      return reply.code(201).send({ request, pack, documents });
+    } catch (error) {
+      return reply.code(400).send({ error: publicSagErrorMessage(error) });
+    }
+  });
+
   // policies 与 runtime 仅供测试 / 后续装配引用，不直接暴露 API。
   void policies;
   void runtime;
@@ -1523,7 +1819,9 @@ export function buildCompositionRoot(
 }
 
 /** 只有地址与令牌同时显式存在时才启用 SAG；避免半配置绕过 SQLite 基线。 */
-function createSagTransport(options: CompositionRootOptions): SagMirrorTransport | undefined {
+function createSagTransport(
+  options: CompositionRootOptions
+): (SagMirrorTransport & Partial<SagSourceDocumentTransport>) | undefined {
   if (options.sagTransportOverride) return options.sagTransportOverride;
   const baseUrl = process.env.TRACEPILOT_SAG_BASE_URL;
   const token = process.env.TRACEPILOT_SAG_TOKEN;
@@ -1532,6 +1830,21 @@ function createSagTransport(options: CompositionRootOptions): SagMirrorTransport
     throw new Error("SAG 配置不完整：TRACEPILOT_SAG_BASE_URL 与 TRACEPILOT_SAG_TOKEN 必须同时设置");
   }
   return new SagHttpTransport({ baseUrl, token });
+}
+
+/** 避免让 HTTP 层向浏览器暴露本机地址、令牌或上游原始响应。 */
+function publicSagErrorMessage(error: unknown): string {
+  if (error instanceof SagKnowledgeSearchError || error instanceof SagTransportError) {
+    return error.message;
+  }
+  return "本机 SAG 操作失败";
+}
+
+function isSagSourceDocumentTransport(
+  transport: SagMirrorTransport & Partial<SagSourceDocumentTransport>
+): transport is SagMirrorTransport & SagSourceDocumentTransport {
+  return typeof transport.upsertSourceDocument === "function" &&
+    typeof transport.searchSourceDocuments === "function";
 }
 
 /** Dashboard 显示的单条执行产物预览上限。完整产物仍保存在 SQLite 真源。 */

@@ -404,9 +404,12 @@ describe("OmpAdapter argv 组装与治理（validateOmpArgv）", () => {
     await omp.review(sampleReviewInput());
     const argv = runner.lastArgv!;
     const modeIdx = argv.indexOf("--mode");
-    expect(argv[modeIdx + 1]).toBe("text");
+    expect(argv[modeIdx + 1]).toBe("json");
     expect(argv).toContain("--no-tools");
     expect(argv).not.toContain("--tools");
+    expect(argv).toContain("--system-prompt");
+    expect(argv[argv.indexOf("--system-prompt") + 1]).toContain("tracepilot_review_result");
+    expect(argv[argv.indexOf("--thinking") + 1]).toBe("off");
     expect(argv[argv.length - 1]).toContain('"locator": "src/users.py:1"');
     expect(argv[argv.length - 1]).toContain('"contentHash": "fnv1a32-test"');
   });
@@ -840,6 +843,24 @@ describe("extractReviewResult", () => {
     expect(result.findings[0]).toMatchObject({ category: "regression_test" });
   });
 
+  it("完整 TracePilot 审查信封按确定性规则通过", () => {
+    const stdout = `<tracepilot_review_result>\n${reviewJson("compatibility")}\n</tracepilot_review_result>`;
+    const result = extractReviewResult(stdout, sampleReviewInput());
+
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ category: "compatibility" });
+  });
+
+  it("TracePilot 审查信封外存在说明文字时失败关闭", () => {
+    const secretText = "模型不应泄露的附加说明";
+    const stdout = `${secretText}\n<tracepilot_review_result>\n${reviewJson("compatibility")}\n</tracepilot_review_result>`;
+    const result = extractReviewResult(stdout, sampleReviewInput());
+
+    expect(result.verdict).toBe("block");
+    expect(result.findings[0]).toMatchObject({ priority: "P1", category: "other" });
+    expect(result.findings[0]?.message).not.toContain(secretText);
+  });
+
   it("仅结束 Markdown 围栏且正文是完整 JSON 时通过", () => {
     const stdout = `${reviewJson("regression_test")}\n\`\`\``;
     const result = extractReviewResult(stdout, sampleReviewInput());
@@ -1153,14 +1174,14 @@ describe("OmpAdapter analyze/develop/review/cancel 行为", () => {
     const omp = makeOmpAdapter({ processRunner: runner });
     const result = await omp.review(sampleReviewInput());
     const modeIdx = runner.lastArgv!.indexOf("--mode");
-    expect(runner.lastArgv![modeIdx + 1]).toBe("text");
+    expect(runner.lastArgv![modeIdx + 1]).toBe("json");
     expect(result.verdict).toBe("ship");
     expect(result.findings).toHaveLength(1);
     expect(result.findings[0]).toMatchObject({ priority: "P3", locator: "src/users.py:10" });
     expect(result.summary).toBe("修复正确，测试通过");
   });
 
-  it("review 通过真实 argv 传递无围栏的严格 JSON 输出协议", async () => {
+  it("review 通过真实 argv 传递 TracePilot 严格审查信封协议", async () => {
     const runner = makeStubRunner({
       stdout: JSON.stringify({ verdict: "block", findings: [], summary: "需要人工复核" })
     });
@@ -1178,11 +1199,14 @@ describe("OmpAdapter analyze/develop/review/cancel 行为", () => {
     const outputRequirements = prompt.slice(outputRequirementsStart, reviewPointsStart);
     expect(outputRequirements).not.toContain("```");
     expect(outputRequirements).toContain(buildReviewResultOutputExample());
-    expect(outputRequirements).toContain("只输出一个 JSON 对象");
-    expect(outputRequirements).toContain("不得包含任何额外文本");
-    expect(outputRequirements).toContain("首字符必须是 `{`");
-    expect(outputRequirements).toContain("末字符必须是 `}`");
+    expect(outputRequirements).toContain("<tracepilot_review_result>");
+    expect(outputRequirements).toContain("信封外不得有任何字符");
+    expect(outputRequirements).toContain("信封内容必须是一个 JSON 对象");
+    expect(outputRequirements).toContain("首字符必须是 <tracepilot_review_result>");
+    expect(outputRequirements).toContain("末字符必须是 </tracepilot_review_result>");
     expect(outputRequirements).toContain("不要输出 Markdown JSON 围栏");
+    expect(prompt).not.toContain("```json");
+    expect(prompt).not.toContain("```diff");
   });
 
   it("review 在 omp 返回非 JSON 文本时回退到 block", async () => {
@@ -1210,6 +1234,39 @@ describe("OmpAdapter analyze/develop/review/cancel 行为", () => {
     expect(result.findings[0]?.message).toContain("stdoutBytes=");
     expect(result.findings[0]?.message).toContain("markdownFenceStart=false");
     expect(result.findings[0]?.message).toContain("markdownFenceEnd=false");
+  });
+
+  it("review 截断但尾部保留完整 terminal assistant 消息时可严格解析", async () => {
+    const review = JSON.stringify({
+      verdict: "ship",
+      findings: [],
+      rootCause: {
+        text: "旧版返回结构被新实现覆盖",
+        confidence: 0.9,
+        evidenceIds: ["e-1"]
+      },
+      summary: "终端审查结果完整"
+    });
+    const stdout = [
+      JSON.stringify({ type: "thinking_end", message: "已截断的前序事件不参与 Review 解析" }),
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: review }] }
+      }),
+      JSON.stringify({ type: "turn_end", isTerminal: true })
+    ].join("\n");
+    const runner = makeStubRunner({
+      stdout,
+      truncated: true,
+      originalBytes: 524288,
+      retainedBytes: Buffer.byteLength(stdout, "utf8")
+    });
+    const omp = makeOmpAdapter({ processRunner: runner });
+
+    const result = await omp.review(sampleReviewInput());
+
+    expect(result.verdict).toBe("ship");
+    expect(result.summary).toBe("终端审查结果完整");
   });
 
   it("review 在 omp 超时时抛 OmpUnavailableError", async () => {

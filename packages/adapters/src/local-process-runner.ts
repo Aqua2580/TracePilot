@@ -75,7 +75,7 @@ export class LocalProcessRunner implements ProcessRunner {
       shell: false
     });
 
-    // 3. 流式读取 stdout/stderr 到缓冲区，按 maxOutputBytes 截断。
+    // 3. 流式读取 stdout/stderr 到缓冲区，按 maxOutputBytes 截断并保留尾部。
     //    P2-02：originalBytes 持续累计总字节数（含被丢弃部分），
     //    retainedBytes 仅记录保留缓冲区大小。
     let stdout = Buffer.alloc(0);
@@ -89,31 +89,13 @@ export class LocalProcessRunner implements ProcessRunner {
     child.stdout?.on("data", (chunk: Buffer) => {
       // P2-02：无论是否保留，都计入原始字节数。
       stdoutOriginalBytes += chunk.length;
-      if (stdout.length >= max) {
-        stdoutTruncated = true;
-        return;
-      }
-      const room = max - stdout.length;
-      if (chunk.length > room) {
-        stdout = Buffer.concat([stdout, chunk.subarray(0, room)]);
-        stdoutTruncated = true;
-      } else {
-        stdout = Buffer.concat([stdout, chunk]);
-      }
+      stdoutTruncated = stdoutTruncated || stdoutOriginalBytes > max;
+      stdout = retainOutputTail(stdout, chunk, max);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       stderrOriginalBytes += chunk.length;
-      if (stderr.length >= max) {
-        stderrTruncated = true;
-        return;
-      }
-      const room = max - stderr.length;
-      if (chunk.length > room) {
-        stderr = Buffer.concat([stderr, chunk.subarray(0, room)]);
-        stderrTruncated = true;
-      } else {
-        stderr = Buffer.concat([stderr, chunk]);
-      }
+      stderrTruncated = stderrTruncated || stderrOriginalBytes > max;
+      stderr = retainOutputTail(stderr, chunk, max);
     });
 
     let terminationPromise: Promise<ProcessTerminationResult> | undefined;
@@ -164,6 +146,12 @@ export class LocalProcessRunner implements ProcessRunner {
     // 把取消请求误认为已经完成。
     const termination = terminationPromise ? await terminationPromise : undefined;
 
+    // 截断可能从一行 NDJSON 或 UTF-8 字符中间开始。丢弃保留尾部的首个
+    // 不完整行，保证后续事件解析不会把半行误判为完整事件。此操作只在已
+    // 截断时执行，仍保持严格的 maxOutputBytes 上限。
+    if (stdoutTruncated) stdout = discardLeadingPartialLine(stdout);
+    if (stderrTruncated) stderr = discardLeadingPartialLine(stderr);
+
     const endedAt = new Date().toISOString();
     const originalBytes = stdoutOriginalBytes + stderrOriginalBytes;
     const retainedBytes = stdout.length + stderr.length;
@@ -182,6 +170,26 @@ export class LocalProcessRunner implements ProcessRunner {
       endedAt
     };
   }
+}
+
+/**
+ * 把新输出追加到受限缓冲区，并保留最后 maxBytes 字节。
+ *
+ * Omp 的最终 assistant message 位于 JSON 事件流尾部；保留尾部既符合
+ * ProcessRunner 的文档承诺，也避免大段 thinking/tool 事件挤掉最终结果。
+ */
+function retainOutputTail(current: Buffer, chunk: Buffer, maxBytes: number): Buffer {
+  const merged = current.length === 0 ? chunk : Buffer.concat([current, chunk]);
+  return merged.length > maxBytes ? merged.subarray(merged.length - maxBytes) : merged;
+}
+
+/**
+ * 截断尾部的开头不一定正好落在换行边界；删除第一个换行前的残片，防止
+ * NDJSON 解析器把不完整 JSON 当作坏事件。若没有完整行，返回空缓冲区。
+ */
+function discardLeadingPartialLine(buffer: Buffer): Buffer {
+  const newlineIndex = buffer.indexOf(0x0a);
+  return newlineIndex === -1 ? Buffer.alloc(0) : buffer.subarray(newlineIndex + 1);
 }
 
 /**

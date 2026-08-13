@@ -193,10 +193,14 @@ describe("SQLite 迁移", () => {
     const versions = getAppliedVersions(db);
     const latest = getLatestMigrationVersion();
     expect(versions).toEqual(Array.from({ length: latest }, (_, index) => index + 1));
-    expect(latest).toBe(9);
+    expect(latest).toBe(11);
     const columns = db.prepare("PRAGMA table_info(sag_outbox)").all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining([
-      "project_id", "repair_record_id", "payload_json", "content_hash", "status", "attempts", "next_attempt_at"
+      "project_id", "repair_record_id", "payload_json", "content_hash", "status", "attempts", "next_attempt_at", "lease_expires_at"
+    ]));
+    const sourceDocumentColumns = db.prepare("PRAGMA table_info(sag_source_documents)").all() as Array<{ name: string }>;
+    expect(sourceDocumentColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+      "project_id", "knowledge_source_id", "document_id", "kind", "locator", "title", "content_hash"
     ]));
     closeDatabase(db);
   });

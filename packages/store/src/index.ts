@@ -30,7 +30,16 @@ export { SqliteUnitOfWork, type SqliteUnitOfWorkDeps } from "./sqlite-unit-of-wo
 export { SqliteRepositories } from "./sqlite-repositories.js";
 export { SqliteRepairMemoryAdapter } from "./sqlite-repair-memory-adapter.js";
 export { SqliteSagOutbox, type SagOutboxProcessResult } from "./sqlite-sag-outbox.js";
-export { createSqliteStore, type SqliteStore } from "./create-store.js";
+export {
+  BENCHMARK_FIXTURES,
+  type BenchmarkFixture
+} from "./benchmarks.js";
+export {
+  createSqliteStore,
+  SqliteSagSourceDocuments,
+  type SqliteStore,
+  type SagSourceDocumentRegistration
+} from "./create-store.js";
 export {
   RuntimeEventBuffer,
   type RuntimeEventBufferDeps
