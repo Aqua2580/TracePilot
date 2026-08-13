@@ -341,7 +341,7 @@ describe("SagHttpTransport", () => {
         calls.push({ method: init?.method ?? "GET", url: String(input) });
         if (init?.method === "POST") {
           return new Response(JSON.stringify({
-            id: "document-1", source_id: "source-a", status: "pending"
+            id: "document-1", source_id: "source-a", status: "extracting"
           }), { status: 201 });
         }
         return new Response(JSON.stringify({

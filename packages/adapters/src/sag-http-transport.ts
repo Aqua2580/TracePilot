@@ -312,7 +312,11 @@ function parseIngestReceipt(value: unknown): IngestReceipt {
   if (rawStatus && ["FAILED", "ERROR", "CANCELLED", "CANCELED"].includes(rawStatus)) {
     return { state: "FAILED", ...(documentId ? { documentId } : {}) };
   }
-  if (rawStatus && ["PENDING", "QUEUED", "PROCESSING", "RUNNING", "INGESTING", "INDEXING"].includes(rawStatus)) {
+  // SAG 1.5 DocumentStatus 使用 pending/loading/extracting；这些不是失败，
+  // 必须继续通过受控文档地址轮询，直到 ready 或 failed。
+  if (rawStatus && [
+    "PENDING", "LOADING", "EXTRACTING", "QUEUED", "PROCESSING", "RUNNING", "INGESTING", "INDEXING"
+  ].includes(rawStatus)) {
     return {
       state: "PENDING",
       ...(statusUrl ? { statusUrl } : {}),
