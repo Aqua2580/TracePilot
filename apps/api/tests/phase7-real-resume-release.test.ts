@@ -6,6 +6,8 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -33,5 +35,9 @@ describeWhenExplicitlyAuthorized("Phase 7 真实 Resume Release 前置门禁", (
     expect(process.env.TRACEPILOT_SAG_TOKEN).toMatch(/.+/);
     expect(process.env.TRACEPILOT_PHASE7_SAG_SOURCE_ID).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
     expect(process.env.TRACEPILOT_PHASE7_PYTHON).toMatch(/.+/);
+    const python = process.env.TRACEPILOT_PHASE7_PYTHON!;
+    expect(existsSync(python)).toBe(true);
+    expect(() => execFileSync(python, ["-c", "import debugpy, pytest"], { stdio: "ignore", timeout: 5_000 }))
+      .not.toThrow();
   });
 });

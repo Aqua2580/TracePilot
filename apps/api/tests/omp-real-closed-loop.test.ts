@@ -64,8 +64,12 @@ function checkCommonPrerequisites(): boolean {
  */
 function checkPythonPrerequisites(): boolean {
   if (!checkCommonPrerequisites()) return false;
+  const pythonPath = phase7RealRunRequested
+    ? process.env.TRACEPILOT_PHASE7_PYTHON?.trim()
+    : "python";
+  if (!pythonPath || (phase7RealRunRequested && !existsSync(pythonPath))) return false;
   try {
-    execFileSync("python", ["-m", "pytest", "--version"], {
+    execFileSync(pythonPath, ["-m", "pytest", "--version"], {
       stdio: "ignore",
       encoding: "utf8",
       timeout: 5000
@@ -151,7 +155,7 @@ if (realRunRequested) {
   if (!pythonPrerequisitesAvailable) {
     throw new Error(
       "TRACEPILOT_OMP_REAL_STRICT=1 但 Python 真实任务前置条件缺失：" +
-      "python -m pytest --version 未通过。" +
+      `${phase7RealRunRequested ? "TRACEPILOT_PHASE7_PYTHON" : "python"} -m pytest --version 未通过。` +
       "无法完成两个真实 omp 任务验收 —— 请安装并检查 pytest 后重试。"
     );
   }
@@ -285,6 +289,7 @@ function createPythonFailingRepo(tmpRoot: string): {
 }
 
 function pythonFailingProject(repoPath: string): Project {
+  const pythonPath = phase7RealConfiguration?.pythonPath ?? "python";
   return {
     id: "proj-omp-python",
     name: "Python 失败任务（omp 真实闭环）",
@@ -294,7 +299,7 @@ function pythonFailingProject(repoPath: string): Project {
     commands: {
       // 真实受控任务只允许修改 src/users.py；禁用 Python / pytest 运行缓存，
       // 避免测试框架自身生成的字节码被误判为越界源码修改。
-      test: { argv: ["python", "-B", "-m", "pytest", "-p", "no:cacheprovider", "-v"], timeoutMs: 60000 }
+      test: { argv: [pythonPath, "-B", "-m", "pytest", "-p", "no:cacheprovider", "-v"], timeoutMs: 60000 }
     },
     ...(phase7RealConfiguration ? { knowledgeSourceId: phase7RealConfiguration.sourceId } : {}),
     createdAt: "2026-07-28T00:00:00.000Z"
@@ -901,7 +906,7 @@ describe.skipIf(!shouldRunPython)(
           //      取输出断言失败信息存在。使用 tests/ 路径与 pytest.ini 的 testpaths 一致。
           let initialTestOutput = "";
           try {
-            execFileSync("python", ["-B", "-m", "pytest", "-p", "no:cacheprovider", "tests/", "--tb=short"], {
+            execFileSync(phase7RealConfiguration?.pythonPath ?? "python", ["-B", "-m", "pytest", "-p", "no:cacheprovider", "tests/", "--tb=short"], {
               cwd: worktree.path,
               encoding: "utf8",
               timeout: 30000,

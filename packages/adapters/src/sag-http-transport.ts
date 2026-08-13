@@ -18,7 +18,10 @@ import type {
 } from "@tracepilot/core";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+const INGEST_READY_TIMEOUT_MS = 90_000;
+const INGEST_READY_POLL_MS = 1_000;
 const MAX_EXCERPT_LENGTH = 2_000;
+const MAX_SOURCE_SEGMENT_LENGTH = 1_024;
 const DOCUMENT_KINDS = new Set<KnowledgeDocumentKind>([
   "adr",
   "issue",
@@ -91,7 +94,7 @@ export class SagHttpTransport implements SagMirrorTransport, SagSourceDocumentTr
       `tracepilot_content_hash=${payload.contentHash}`,
       `tracepilot_title=${title}`
     ].join("\n");
-    await this.request(
+    await this.ingestAndWait(
       `sources/${encodeURIComponent(payload.knowledgeSourceId)}/documents/ingest`,
       {
         title,
@@ -124,16 +127,19 @@ export class SagHttpTransport implements SagMirrorTransport, SagSourceDocumentTr
   /** 受控导入审查过的 ADR、Issue、PR 或 Repair Record 来源。 */
   async upsertSourceDocument(document: SagSourceDocument): Promise<void> {
     validateSourceDocument(document);
-    const text = [
+    const metadata = [
       `tracepilot_document_id=${document.id}`,
       `tracepilot_project_id=${document.projectId}`,
       `tracepilot_document_kind=${document.kind}`,
       `tracepilot_locator=${document.locator}`,
       `tracepilot_content_hash=${document.contentHash}`,
-      `tracepilot_title=${document.title}`,
-      document.text
+      `tracepilot_title=${document.title}`
     ].join("\n");
-    await this.request(
+    // SAG 会在后台按自身策略切分文本。将完整、可反向验证的元数据附在
+    // 每个 TracePilot 受控小段前，确保长 ADR/Issue/PR 的中段命中也不会
+    // 因为只有首段带 metadata 而被误认成不可信来源。
+    const text = splitSourceTextWithMetadata(metadata, document.text);
+    await this.ingestAndWait(
       `sources/${encodeURIComponent(document.knowledgeSourceId)}/documents/ingest`,
       { title: document.title, text },
       document.id
@@ -161,6 +167,35 @@ export class SagHttpTransport implements SagMirrorTransport, SagSourceDocumentTr
       input.abortSignal
     );
     return parseSourceDocuments(response, input);
+  }
+
+  /**
+   * SAG 导入是后台任务：HTTP 2xx 只表示已受理，不能代表文档已经进入可
+   * 检索索引。返回 READY 才允许上层将来源登记为可回读；处理中必须提供
+   * 同一 loopback API 的状态/任务地址，否则失败关闭而不是盲等搜索。
+   */
+  private async ingestAndWait(path: string, body: unknown, idempotencyKey: string): Promise<void> {
+    const accepted = await this.request(path, body, idempotencyKey);
+    const receipt = parseIngestReceipt(accepted);
+    if (receipt.state === "READY") return;
+    if (receipt.state === "FAILED") {
+      throw new SagTransportError("http", "本机 SAG 已明确报告导入失败");
+    }
+    if (!receipt.statusUrl) {
+      throw new SagTransportError("malformed_response", "本机 SAG 已受理导入但未返回可轮询的文档或任务状态地址");
+    }
+    const deadline = Date.now() + INGEST_READY_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await sleep(INGEST_READY_POLL_MS);
+      const status = parseIngestReceipt(await this.requestStatus(receipt.statusUrl));
+      if (status.state === "READY") return;
+      if (status.state === "FAILED") {
+        throw new SagTransportError("http", "本机 SAG 已明确报告导入失败");
+      }
+      // 服务可能在处理中返回下一跳 Job 地址；未提供时沿用首次地址。
+      receipt.statusUrl = status.statusUrl ?? receipt.statusUrl;
+    }
+    throw new SagTransportError("timeout", "本机 SAG 导入在 90 秒内未达到可检索状态");
   }
 
   private async request(
@@ -203,6 +238,113 @@ export class SagHttpTransport implements SagMirrorTransport, SagSourceDocumentTr
       throw new SagTransportError("malformed_response", "本地服务返回的 JSON 无法解析");
     }
   }
+
+  private async requestStatus(value: string): Promise<unknown> {
+    const url = validateStatusUrl(value, this.baseUrl);
+    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.options.token}` },
+        signal: timeout
+      });
+    } catch (error) {
+      if (timeout.aborted || isTimeoutError(error)) {
+        throw new SagTransportError("timeout", "本机 SAG 状态查询在 15 秒内未响应");
+      }
+      throw new SagTransportError("unavailable", "无法连接本机 SAG 状态查询");
+    }
+    if (!response.ok) {
+      throw new SagTransportError("http", `本机 SAG 状态查询返回 HTTP ${response.status}`);
+    }
+    try {
+      return await response.json();
+    } catch {
+      throw new SagTransportError("malformed_response", "本机 SAG 状态查询返回的 JSON 无法解析");
+    }
+  }
+}
+
+type IngestState = "READY" | "PENDING" | "FAILED";
+
+interface IngestReceipt {
+  readonly state: IngestState;
+  statusUrl?: string;
+}
+
+function parseIngestReceipt(value: unknown): IngestReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new SagTransportError("malformed_response", "本机 SAG 导入响应不是对象");
+  }
+  const record = value as Record<string, unknown>;
+  // 有些 SAG 版本以 data 包装文档/任务；保持解析仅限明确字段，不能把任意
+  // 响应文本误认成已索引状态。
+  const data = objectField(record, "data");
+  const nested = [
+    record,
+    objectField(record, "document"),
+    objectField(record, "job"),
+    data,
+    data && objectField(data, "document"),
+    data && objectField(data, "job")
+  ]
+    .filter((item): item is Record<string, unknown> => Boolean(item));
+  const rawStatus = nested
+    .map((item) => stringField(item, "status") ?? stringField(item, "state"))
+    .find((item): item is string => Boolean(item))
+    ?.trim()
+    .toUpperCase();
+  const statusUrl = nested
+    .map((item) => stringField(item, "status_url") ?? stringField(item, "statusUrl") ?? stringField(item, "job_url") ?? stringField(item, "jobUrl"))
+    .find((item): item is string => Boolean(item));
+  if (rawStatus && ["READY", "COMPLETED", "INDEXED", "SUCCESS", "SUCCEEDED"].includes(rawStatus)) {
+    return { state: "READY" };
+  }
+  if (rawStatus && ["FAILED", "ERROR", "CANCELLED", "CANCELED"].includes(rawStatus)) {
+    return { state: "FAILED" };
+  }
+  if (rawStatus && ["PENDING", "QUEUED", "PROCESSING", "RUNNING", "INGESTING", "INDEXING"].includes(rawStatus)) {
+    return { state: "PENDING", ...(statusUrl ? { statusUrl } : {}) };
+  }
+  throw new SagTransportError("malformed_response", "本机 SAG 导入响应缺少可识别的文档或任务状态");
+}
+
+function objectField(record: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = record[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function validateStatusUrl(value: string, baseUrl: URL): URL {
+  let url: URL;
+  try {
+    url = new URL(value, baseUrl);
+  } catch {
+    throw new SagTransportError("malformed_response", "本机 SAG 返回的状态地址非法");
+  }
+  if (url.origin !== baseUrl.origin || !url.pathname.startsWith(baseUrl.pathname)) {
+    throw new SagTransportError("malformed_response", "本机 SAG 返回了越出受控 API 根路径的状态地址");
+  }
+  return url;
+}
+
+function splitSourceTextWithMetadata(metadata: string, source: string): string {
+  const segments: string[] = [];
+  for (let start = 0; start < source.length; start += MAX_SOURCE_SEGMENT_LENGTH) {
+    segments.push(`${metadata}\ntracepilot_segment_offset=${start}\n${source.slice(start, start + MAX_SOURCE_SEGMENT_LENGTH)}`);
+  }
+  return segments.join("\n\n");
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function validateLocalSagUrl(value: string): URL {

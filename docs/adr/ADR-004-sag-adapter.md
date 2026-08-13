@@ -35,6 +35,13 @@ Phase 7 使用本机 SAG 的 source-scoped 接口：
 内容哈希。结果还必须与 SQLite `sag_source_documents` 中的项目、Source、类别、
 locator、标题和哈希完全一致，才可作为新 Evidence Pack 的候选材料。
 
+SAG 的文档写入是后台处理：`SagHttpTransport` 把 `202`、处理中状态或无法读取
+状态的响应视为未投递完成。它必须从写入回执取得同源的文档或任务状态地址，轮询到
+`READY` / `COMPLETED` / `INDEXED` 后才确认 outbox；失败、超时或没有可检查状态地址
+都会保留为可重试失败。长内容按受限段落重复携带 TracePilot 来源元数据，确保 SAG
+分块后仍可由 SQLite 的来源链反向核验。这个等待发生在 SQLite 提交之后，绝不占用
+SQLite 写事务或阻塞任务完成。
+
 ## 未验证限制
 
 公开资料确认 source-scoped 写入与搜索，但没有为 TracePilot 当前版本提供已验证

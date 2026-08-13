@@ -14,8 +14,8 @@ pnpm --filter @tracepilot/api run evaluate:phase7
 
 | 组别 | Adapter | 样本数 | 关键来源 Recall@5 | 其余发布指标 |
 | --- | --- | ---: | ---: | --- |
-| 无记忆 | 实际调用空 `FakeKnowledgeAdapter` | 8 | 0.00 | `null`（未测量） |
-| SQLite Memory | 实际调用已种入固定 Repair Record 的 `FakeKnowledgeAdapter` | 8 | 0.625 | `null`（未测量） |
+| 无记忆 | 显式空结果；不创建 Memory Adapter | 8 | 0.00 | `null`（未测量） |
+| SQLite Memory | 临时真实 SQLite 迁移 + `SqliteRepairMemoryAdapter` | 8 | 0.625 | `null`（未测量） |
 | SAG 增强 | 实际调用 `SagKnowledgeAdapter`；内存传输替身只重排同项目 SQLite 真源 | 8 | 1.00 | `null`（未测量） |
 
 本夹具证明的是固定输入、项目隔离、三种 Adapter 调用和来源排序的可复算性。SAG

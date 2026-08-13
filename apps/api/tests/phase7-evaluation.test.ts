@@ -31,6 +31,7 @@ describe("Phase 7 三组本地检索评测", () => {
       "bench-08-vitest-snapshot"
     ]);
     expect(PHASE7_EVALUATION_INPUT_HASH).toMatch(/^sha256-[a-f0-9]{64}$/);
+    expect(PHASE7_EVALUATION_CONFIGURATION.adapterByGroup.sqlite_memory).toContain("SqliteRepairMemoryAdapter");
     expect(PHASE7_EVALUATION_CONFIGURATION.adapterByGroup.sag_enhanced).toContain("SagKnowledgeAdapter");
   });
 

@@ -193,7 +193,7 @@ describe("SagHttpTransport", () => {
       token: "synthetic-token",
       fetchImpl: async (_input, init) => {
         capturedBody = JSON.parse(String(init?.body));
-        return new Response(JSON.stringify({ id: "document-1" }), { status: 200 });
+        return new Response(JSON.stringify({ document: { id: "document-1", status: "READY" } }), { status: 200 });
       }
     });
 
@@ -276,6 +276,93 @@ describe("SagHttpTransport", () => {
       contentHash: hashSagSourceDocument("不同正文")
     })).rejects.toMatchObject({ code: "invalid_configuration" });
     expect(requests).toBe(0);
+  });
+
+  it("导入仅在本机 SAG 文档状态 READY 后成功，并保持长文档每段的反向校验元数据", async () => {
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+    const longText = "长文档正文。".repeat(600);
+    const transport = new SagHttpTransport({
+      baseUrl: "http://127.0.0.1:8000/api/v1",
+      token: "synthetic-token",
+      fetchImpl: async (input, init) => {
+        calls.push({ method: init?.method ?? "GET", url: String(input), body: init?.body });
+        if ((init?.method ?? "GET") === "POST") {
+          return new Response(JSON.stringify({
+            document: { status: "PROCESSING", status_url: "documents/document-1/status" }
+          }), { status: 202 });
+        }
+        return new Response(JSON.stringify({ document: { status: "READY" } }), { status: 200 });
+      }
+    });
+
+    await transport.upsertSourceDocument({
+      schemaVersion: 1,
+      projectId: "project-a",
+      knowledgeSourceId: "source-a",
+      id: "adr-long-1",
+      kind: "adr",
+      locator: "docs/adr/ADR-long.md",
+      title: "长 ADR",
+      text: longText,
+      contentHash: hashSagSourceDocument(longText)
+    });
+
+    expect(calls.map((call) => call.method)).toEqual(["POST", "GET"]);
+    const body = calls[0]!.body as string;
+    expect(body.match(/tracepilot_document_id=adr-long-1/g)?.length).toBeGreaterThan(1);
+    expect(body.match(/tracepilot_content_hash=sha256-/g)?.length).toBeGreaterThan(1);
+  });
+
+  it("SAG 导入未提供可检查状态时失败关闭，不能把 HTTP 已受理视为可检索", async () => {
+    const transport = new SagHttpTransport({
+      baseUrl: "http://127.0.0.1:8000/api/v1",
+      token: "synthetic-token",
+      fetchImpl: async () => new Response(JSON.stringify({ id: "document-1" }), { status: 202 })
+    });
+    await expect(transport.upsertRepairRecord({
+      schemaVersion: 1,
+      projectId: "project-a",
+      knowledgeSourceId: "source-a",
+      repairRecordId: "repair-a",
+      contentHash: `sha256-${"a".repeat(64)}`,
+      symptom: "构建失败",
+      rootCause: "依赖缺失",
+      fixSummary: "补齐依赖",
+      sourceLocator: "synthetic/repair-a"
+    })).rejects.toMatchObject({ code: "malformed_response" } satisfies Partial<SagTransportError>);
+  });
+
+  it("SAG 状态查询接受受控 data 包装，但仍必须达到 READY", async () => {
+    const calls: Array<{ method: string; url: string }> = [];
+    const transport = new SagHttpTransport({
+      baseUrl: "http://127.0.0.1:8000/api/v1",
+      token: "synthetic-token",
+      fetchImpl: async (input, init) => {
+        calls.push({ method: init?.method ?? "GET", url: String(input) });
+        if (init?.method === "POST") {
+          return new Response(JSON.stringify({
+            data: { status: "PROCESSING", job_url: "jobs/job-1" }
+          }), { status: 202 });
+        }
+        return new Response(JSON.stringify({ data: { job: { status: "INDEXED" } } }), { status: 200 });
+      }
+    });
+
+    await transport.upsertSourceDocument({
+      id: "adr-data-1",
+      projectId: "project-1",
+      knowledgeSourceId: "source-1",
+      kind: "adr",
+      locator: "docs/adr/data.md",
+      title: "Data 包装",
+      text: "合成内容",
+      contentHash: hashSagSourceDocument("合成内容")
+    });
+
+    expect(calls).toEqual([
+      { method: "POST", url: "http://127.0.0.1:8000/api/v1/sources/source-1/documents/ingest" },
+      { method: "GET", url: "http://127.0.0.1:8000/api/v1/jobs/job-1" }
+    ]);
   });
 
   it("调用方取消来源检索时返回取消错误，不把请求误报为离线", async () => {

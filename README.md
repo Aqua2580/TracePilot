@@ -334,9 +334,9 @@ $env:TRACEPILOT_PHASE7_DEBUGPY_ACK = "1"
 pnpm test:phase7-debugpy
 ```
 
-未同时设置这两个变量时，真实 debugpy 场景会明确跳过，其他 Phase 7 契约仍照常
-运行。该专项只连接本机 loopback debugpy，**不调用真实 SAG、Omp 或模型**，不能
-替代独立 Resume Release 验收。
+缺少任一变量、解释器不存在，或该解释器不能导入 `debugpy` 与 `pytest` 时，该严格
+门禁会以非零退出码失败；它不会把真实用例跳过后误报成功。该专项只连接本机
+loopback debugpy，**不调用真实 SAG、Omp 或模型**，不能替代独立 Resume Release 验收。
 
 真实 Resume Release 门禁必须由用户再次明确授权后运行，它会调用两项真实 Omp
 合成任务并向操作者配置的本机 SAG Source 写入合成资料：

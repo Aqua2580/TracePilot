@@ -15,7 +15,7 @@
     "test:phase5-real": "pnpm --filter @tracepilot/api run test:phase5-real",
     "test:phase7-debugpy": "pnpm --filter @tracepilot/api run test:phase7-debugpy",
     "test:phase7-real": "pnpm --filter @tracepilot/api run test:phase7-real",
-    "test:phase7": "pnpm --filter @tracepilot/store exec vitest run tests/sag-outbox.test.ts && pnpm --filter @tracepilot/adapters exec vitest run tests/sag-knowledge-adapter.test.ts tests/debugpy-runtime-evidence-adapter.test.ts && pnpm --filter @tracepilot/api exec vitest run tests/phase7-sag.test.ts tests/phase7-evaluation.test.ts tests/phase7-runtime-evidence.test.ts",
+    "test:phase7": "pnpm --filter @tracepilot/store exec vitest run tests/sag-outbox.test.ts && pnpm --filter @tracepilot/adapters exec vitest run tests/sag-knowledge-adapter.test.ts tests/debugpy-runtime-evidence-adapter.test.ts && pnpm --filter @tracepilot/api exec vitest run tests/phase7-sag.test.ts tests/phase7-evaluation.test.ts tests/phase7-release-evaluation.test.ts tests/phase7-runtime-evidence.test.ts",
     "typecheck": "pnpm -r run typecheck",
     "lint": "pnpm -r run lint",
     "lint:root": "eslint ."

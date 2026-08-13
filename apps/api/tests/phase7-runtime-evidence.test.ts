@@ -21,6 +21,11 @@ const phase7Python = process.env.TRACEPILOT_PHASE7_PYTHON;
 const hasPhase7Python = typeof phase7Python === "string" && existsSync(phase7Python);
 const debugpyRunAuthorized = process.env.TRACEPILOT_PHASE7_DEBUGPY_ACK === "1";
 
+// 严格门禁显式要求真实用例时，配置缺失必须失败，不能被 skipIf 掩盖。
+if (debugpyRunAuthorized && !hasPhase7Python) {
+  throw new Error("TRACEPILOT_PHASE7_DEBUGPY_ACK=1 时必须提供存在的 TRACEPILOT_PHASE7_PYTHON");
+}
+
 afterEach(async () => {
   for (const child of processes.splice(0)) {
     await stopChild(child);
