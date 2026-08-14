@@ -509,6 +509,8 @@ async function attachPhase7SagSourceEvidence(
     const text = `${title}：仅用于已授权的 TracePilot Resume Release 合成验证。`;
     return { id, kind, title, text, locator: `phase7/${taskId}/${kind}.md` };
   });
+  // SAG Desktop 的本机后台队列会对同一 Source 的结构化提取串行化。顺序
+  // 写入避免三篇资料同时争用模型与索引资源，从而把健康但拥塞的任务误判为超时。
   for (const document of sourceDocuments) {
     const response = await root.app.inject({
       method: "POST",
@@ -518,28 +520,11 @@ async function attachPhase7SagSourceEvidence(
     expect(response.statusCode, response.body).toBe(201);
   }
 
-  const transport = new SagHttpTransport({
-    baseUrl: phase7RealConfiguration.baseUrl,
-    token: phase7RealConfiguration.token
-  });
-  // 向量检索只承诺按相关性排序，不承诺一次查询必然返回同一任务的全部三类
-  // 文档。分别使用每篇唯一标题回读，才能证明 ADR、Issue、PR 均已到达 ready
-  // 并携带可由 SQLite 反查的元数据，而不把排序偶然性当成索引完成条件。
+  // 每篇资料只经任务 API 回读一次。该 API 内部会调用受控的
+  // SagKnowledgeAdapter，并将命中登记进新的 Evidence Pack。避免先绕过
+  // API 做同样的向量检索再重复一次，降低本机 SAG 在冷启动时的排队压力，
+  // 也确保正式证据只来自服务端的受控读取路径。
   for (const sourceDocument of sourceDocuments) {
-    let recalled: readonly { id: string }[] = [];
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      recalled = await transport.searchSourceDocuments({
-        projectId,
-        knowledgeSourceId: phase7RealConfiguration.sourceId,
-        query: sourceDocument.title,
-        kinds: [sourceDocument.kind],
-        maxResults: 10
-      });
-      if (recalled.some((document) => document.id === sourceDocument.id)) break;
-      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_000));
-    }
-    expect(recalled).toContainEqual(expect.objectContaining({ id: sourceDocument.id, projectId }));
-
     const evidence = await root.app.inject({
       method: "POST",
       url: `/tasks/${taskId}/sag-source-evidence`,
@@ -574,12 +559,19 @@ async function attachPhase7RuntimeEvidenceAndReapprove(
   }
   const port = await reserveLoopbackPort();
   const child = spawn(phase7RealConfiguration.pythonPath, [
+    "-B",
     "-Xfrozen_modules=off",
     "-m", "debugpy",
     "--listen", `127.0.0.1:${port}`,
     "--wait-for-client",
     "-m", "pytest", "-q", "-s", "diagnostics/test_phase7_runtime.py"
-  ], { cwd: worktreePath, stdio: "ignore", windowsHide: true });
+  ], {
+    cwd: worktreePath,
+    stdio: "ignore",
+    windowsHide: true,
+    // -B 与环境变量双重约束：运行时证据不能给受控修复 Diff 留下 .pyc。
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" }
+  });
   try {
     await waitForDebugpyStartup(child);
     const gap = await root.app.inject({
@@ -659,6 +651,14 @@ async function attachPhase7RuntimeEvidenceAndReapprove(
     return { packId: runtimeBody.pack.id, packVersion: runtimeBody.pack.version };
   } finally {
     if (!child.killed) child.kill();
+    // 兼容少数 pytest/debugpy 组合忽略 -B 的情况。这个目录只由本函数写入，
+    // 位于临时 test worktree，必须在 Omp develop 读取 Diff 前移除。
+    rmSync(join(worktreePath, "diagnostics", "__pycache__"), {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 100
+    });
   }
 }
 
@@ -699,7 +699,11 @@ async function assertPhase7ApprovedRecordMirrored(
   });
   let outbox = root.store.sagOutbox.list().filter((event) => event.repair_record_id === record.id);
   expect(outbox).toHaveLength(1);
-  if (outbox[0]!.status !== "SENT") {
+  // outbox 是异步投递：审批完成只保证 SQLite 真源和 PENDING 事件已原子提交。
+  // 这里按固定的首次退避等待一次再投递，证明短暂的本机 SAG 失败可重试，且
+  // 不把 PENDING 错判为已镜像。第二次仍失败则保持失败关闭。
+  for (let attempt = 0; attempt < 2 && outbox[0]!.status !== "SENT"; attempt += 1) {
+    if (attempt > 0) await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_100));
     await root.store.sagOutbox.processReady(transport);
     outbox = root.store.sagOutbox.list().filter((event) => event.repair_record_id === record.id);
   }
@@ -737,7 +741,7 @@ describe.skipIf(!shouldRunPython)(
 
     it(
       "Python 失败任务：omp develop 修复 create_user 使测试通过",
-      { timeout: 600000 },
+      { timeout: 1_800_000 },
       async () => {
         // 1. 准备临时环境
         dbPath = tempDbPath();
@@ -958,7 +962,10 @@ describe.skipIf(!shouldRunPython)(
           // Python 场景额外承担运行时 Evidence 验证。
           if (phase7RealConfiguration) {
             const refreshed = await attachPhase7RuntimeEvidenceAndReapprove(root, task.id, worktree.path);
-            expect(refreshed.packVersion).toBe(4);
+            // 来源 ADR/Issue/PR 的每次受控回读都可能生成新的不可变 Pack。
+            // 因此不能把版本号写死为 4；关键约束是 runtime Evidence 必须建立
+            // 在已计划 Pack 之后，并触发新版本与重新审批。
+            expect(refreshed.packVersion).toBeGreaterThan(packVersion);
           }
 
           // 13. 调用 omp develop 修复 bug
@@ -1056,7 +1063,7 @@ describe.skipIf(!shouldRunJavascript)(
 
     it(
       "JavaScript 失败任务：omp develop 修复 createUser 使测试通过",
-      { timeout: 600000 },
+      { timeout: 1_800_000 },
       async () => {
         // 1. 准备临时环境
         dbPath = tempDbPath();

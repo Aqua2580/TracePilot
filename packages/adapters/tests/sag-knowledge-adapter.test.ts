@@ -3,6 +3,8 @@
 import { describe, expect, it } from "vitest";
 import {
   FakeKnowledgeAdapter,
+  DEFAULT_INGEST_READY_TIMEOUT_MS,
+  DEFAULT_SOURCE_SEARCH_TIMEOUT_MS,
   hashSagSourceDocument,
   SagHttpTransport,
   SagKnowledgeAdapter,
@@ -181,6 +183,11 @@ describe("SagKnowledgeAdapter", () => {
 });
 
 describe("SagHttpTransport", () => {
+  it("为真实本机后台索引保留至少五分钟的有界就绪等待", () => {
+    expect(DEFAULT_INGEST_READY_TIMEOUT_MS).toBeGreaterThanOrEqual(600_000);
+    expect(DEFAULT_SOURCE_SEARCH_TIMEOUT_MS).toBeGreaterThanOrEqual(180_000);
+  });
+
   it("拒绝非 loopback 地址，避免向远程端点发送本地 Repair Memory", () => {
     expect(() => new SagHttpTransport({ baseUrl: "https://example.com/api/v1", token: "token" }))
       .toThrow(SagTransportError);

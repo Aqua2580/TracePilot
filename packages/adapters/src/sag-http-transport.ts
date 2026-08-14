@@ -18,7 +18,18 @@ import type {
 } from "@tracepilot/core";
 
 const REQUEST_TIMEOUT_MS = 15_000;
-const INGEST_READY_TIMEOUT_MS = 90_000;
+/**
+ * 本机 SAG 会在后台依次完成分块、向量化和结构化提取。真实环境中的短文档
+ * 已观测到重启后的首次导入需要额外预热，五分钟仍可能处于 extracting。
+ * 十分钟覆盖本机模型和索引的冷启动，同时仍保持有限超时，避免不可用服务
+ * 导致无限阻塞。
+ */
+export const DEFAULT_INGEST_READY_TIMEOUT_MS = 600_000;
+/**
+ * 首次 source-scoped 向量检索可能触发本机索引加载。它不应复用写入和状态
+ * 查询的短超时，否则文档已 ready 时仍会被错误判为不可用。
+ */
+export const DEFAULT_SOURCE_SEARCH_TIMEOUT_MS = 180_000;
 const INGEST_READY_POLL_MS = 1_000;
 const MAX_EXCERPT_LENGTH = 2_000;
 const MAX_SOURCE_SEGMENT_LENGTH = 1_024;
@@ -164,7 +175,8 @@ export class SagHttpTransport implements SagMirrorTransport, SagSourceDocumentTr
       `sources/${encodeURIComponent(input.knowledgeSourceId)}/search`,
       { query: input.query, strategy: "vector", top_k: input.maxResults },
       undefined,
-      input.abortSignal
+      input.abortSignal,
+      DEFAULT_SOURCE_SEARCH_TIMEOUT_MS
     );
     return parseSourceDocuments(response, input);
   }
@@ -186,7 +198,7 @@ export class SagHttpTransport implements SagMirrorTransport, SagSourceDocumentTr
       throw new SagTransportError("malformed_response", "本机 SAG 已受理导入但未返回可轮询的文档或任务状态地址");
     }
     receipt.statusUrl = initialStatusUrl;
-    const deadline = Date.now() + INGEST_READY_TIMEOUT_MS;
+    const deadline = Date.now() + DEFAULT_INGEST_READY_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await sleep(INGEST_READY_POLL_MS);
       const status = parseIngestReceipt(await this.requestStatus(receipt.statusUrl));
@@ -196,17 +208,22 @@ export class SagHttpTransport implements SagMirrorTransport, SagSourceDocumentTr
       }
       // 服务可能在处理中返回下一跳 Job 地址；未提供时沿用首次地址。
       receipt.statusUrl = status.statusUrl ?? receipt.statusUrl;
+      receipt.lastKnownStatus = status.lastKnownStatus ?? receipt.lastKnownStatus;
     }
-    throw new SagTransportError("timeout", "本机 SAG 导入在 90 秒内未达到可检索状态");
+    throw new SagTransportError(
+      "timeout",
+      `本机 SAG 导入在 ${Math.ceil(DEFAULT_INGEST_READY_TIMEOUT_MS / 60_000)} 分钟内未达到可检索状态（最后状态：${receipt.lastKnownStatus ?? "PENDING"}）`
+    );
   }
 
   private async request(
     path: string,
     body: unknown,
     idempotencyKey?: string,
-    callerSignal?: AbortSignal
+    callerSignal?: AbortSignal,
+    requestTimeoutMs = REQUEST_TIMEOUT_MS
   ): Promise<unknown> {
-    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const timeout = AbortSignal.timeout(requestTimeoutMs);
     const signal = callerSignal
       ? AbortSignal.any([timeout, callerSignal])
       : timeout;
@@ -227,7 +244,10 @@ export class SagHttpTransport implements SagMirrorTransport, SagSourceDocumentTr
         throw new SagTransportError("cancelled", "操作者已取消本地 SAG 查询");
       }
       if (timeout.aborted || isTimeoutError(error)) {
-        throw new SagTransportError("timeout", "本地服务在 15 秒内未响应");
+        throw new SagTransportError(
+          "timeout",
+          `本地服务在 ${Math.ceil(requestTimeoutMs / 1_000)} 秒内未响应`
+        );
       }
       throw new SagTransportError("unavailable", "无法连接本地服务");
     }
@@ -275,6 +295,8 @@ interface IngestReceipt {
   /** SAG 1.5+ DocumentOut 的稳定文档标识，用于受控文档状态轮询。 */
   readonly documentId?: string;
   statusUrl?: string;
+  /** 最近一次由 SAG 明确返回的状态，仅用于本地诊断，绝不代表 ready。 */
+  lastKnownStatus?: string;
 }
 
 function parseIngestReceipt(value: unknown): IngestReceipt {
@@ -307,10 +329,10 @@ function parseIngestReceipt(value: unknown): IngestReceipt {
   );
   const documentId = document && stringField(document, "id");
   if (rawStatus && ["READY", "COMPLETED", "INDEXED", "SUCCESS", "SUCCEEDED"].includes(rawStatus)) {
-    return { state: "READY", ...(documentId ? { documentId } : {}) };
+    return { state: "READY", ...(documentId ? { documentId } : {}), lastKnownStatus: rawStatus };
   }
   if (rawStatus && ["FAILED", "ERROR", "CANCELLED", "CANCELED"].includes(rawStatus)) {
-    return { state: "FAILED", ...(documentId ? { documentId } : {}) };
+    return { state: "FAILED", ...(documentId ? { documentId } : {}), lastKnownStatus: rawStatus };
   }
   // SAG 1.5 DocumentStatus 使用 pending/loading/extracting；这些不是失败，
   // 必须继续通过受控文档地址轮询，直到 ready 或 failed。
@@ -320,7 +342,8 @@ function parseIngestReceipt(value: unknown): IngestReceipt {
     return {
       state: "PENDING",
       ...(statusUrl ? { statusUrl } : {}),
-      ...(documentId ? { documentId } : {})
+      ...(documentId ? { documentId } : {}),
+      lastKnownStatus: rawStatus
     };
   }
   throw new SagTransportError("malformed_response", "本机 SAG 导入响应缺少可识别的文档或任务状态");

@@ -1217,6 +1217,45 @@ describe("OmpAdapter analyze/develop/review/cancel 行为", () => {
     expect(result.findings[0]!.priority).toBe("P1");
   });
 
+  it("review 仅在严格 schema 拒绝时重新独立审查一次，第二次结果仍严格解析", async () => {
+    let calls = 0;
+    const prompts: string[] = [];
+    const runner = {
+      async run(spec: { argv: readonly string[] }) {
+        calls += 1;
+        prompts.push(String(spec.argv.at(-1)));
+        const stdout = calls === 1
+          ? JSON.stringify({
+            verdict: "block",
+            findings: [{ priority: "P1", confidence: 1, category: "logic", message: "不合法枚举" }],
+            summary: "格式错误"
+          })
+          : JSON.stringify({ verdict: "block", findings: [], summary: "重新审查后仍需人工复核" });
+        return {
+          argv: spec.argv,
+          cwd: FAKE_WT,
+          exitCode: 0,
+          stdout,
+          stderr: "",
+          truncated: false,
+          originalBytes: Buffer.byteLength(stdout),
+          retainedBytes: Buffer.byteLength(stdout),
+          timedOut: false,
+          startedAt: "2026-07-27T00:00:00.000Z",
+          endedAt: "2026-07-27T00:00:01.000Z"
+        };
+      }
+    } as unknown as ProcessRunner;
+    const omp = makeOmpAdapter({ processRunner: runner });
+
+    const result = await omp.review(sampleReviewInput());
+
+    expect(calls).toBe(2);
+    expect(result).toMatchObject({ verdict: "block", summary: "重新审查后仍需人工复核" });
+    expect(prompts[1]).toContain("格式纠正重试");
+    expect(prompts[1]).toContain("不得使用 bug、logic、性能、其他或任何中文别名");
+  });
+
   it("review 发现输出截断时失败关闭并保留截断指标", async () => {
     const runner = makeStubRunner({
       stdout: JSON.stringify({ verdict: "ship", findings: [], summary: "ok" }),

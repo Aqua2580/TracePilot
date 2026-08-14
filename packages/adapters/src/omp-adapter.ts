@@ -461,16 +461,41 @@ export class OmpAdapter implements RuntimeAdapter {
       // message_end 提取最终文本，绝不把事件头、工具事件或提示中的围栏
       // 当成 ReviewResult 候选；无法严格解析时仍由提取器失败关闭为 block。
       const parsed = extractReviewResult(result.stdout, input);
-      if (!result.truncated) return parsed;
+      if (!result.truncated && !shouldRetryMalformedReview(parsed)) return parsed;
 
       // ProcessRunner 截断时保留尾部完整行。只有该尾部存在可解析的 Omp
       // terminal assistant message，才能证明 ReviewResult 未受截断影响；
       // 普通文本、缺少终端消息或任何 NDJSON 损坏仍失败关闭。
       const assistantText = extractAssistantTextFromOmpNdjson(result.stdout);
-      if (assistantText.sawOmpEvent && assistantText.text !== null && !assistantText.reason) {
-        return parsed;
+      if (result.truncated && (!assistantText.sawOmpEvent || assistantText.text === null || assistantText.reason)) {
+        return truncatedReviewResult(input, result);
       }
-      return truncatedReviewResult(input, result);
+
+      // Omp 17.x 没有 JSON Schema 参数。首次审查若仅因信封内字段不合规而
+      // 被本地严格解析器拒绝，最多再发起一次完整、无工具的独立审查。绝不
+      // 修补、猜测或放宽模型原文；第二次仍不合规就维持失败关闭。
+      if (!shouldRetryMalformedReview(parsed)) return parsed;
+      const retryArgv = this.buildOmpArgv(
+        input.worktreePath,
+        this.buildReviewFormatRetryPrompt(input),
+        this.opts.defaultTimeoutMs ?? this.opts.processPolicy.timeoutMs,
+        "review"
+      );
+      const retry = await this.runOmpGoverned(retryArgv, input.worktreePath, effectiveSignal);
+      if (retry.timedOut) {
+        throw new OmpUnavailableError(`omp review 格式重试超时（exitCode=${retry.exitCode}）`);
+      }
+      if (retry.exitCode !== 0) {
+        throw new OmpUnavailableError(
+          `omp review 格式重试退出码 ${retry.exitCode}：${truncateStderr(retry.stderr)}`
+        );
+      }
+      const retriedParsed = extractReviewResult(retry.stdout, input);
+      if (!retry.truncated) return retriedParsed;
+      const retryAssistantText = extractAssistantTextFromOmpNdjson(retry.stdout);
+      return retryAssistantText.sawOmpEvent && retryAssistantText.text !== null && !retryAssistantText.reason
+        ? retriedParsed
+        : truncatedReviewResult(input, retry);
     } finally {
       // §7.4 第 1 点：清理 runs 记录。
       this.runs.delete(runId);
@@ -1050,6 +1075,7 @@ export class OmpAdapter implements RuntimeAdapter {
       buildReviewResultOutputExample(),
       "confidence 字段必须是不加引号的 JSON number，取值范围为 [0,1]；required 必须是 JSON boolean true 或 false。",
       "verdict、priority、category 必须分别使用各自枚举中的一个合法值，不得输出枚举说明文本。",
+      "category 只能是 compatibility、regression_test、correctness、security、maintainability、other 之一；不得使用 bug、logic、性能、其他或任何中文别名。",
       "去除首尾空白后，首字符必须是 <tracepilot_review_result>，末字符必须是 </tracepilot_review_result>；不要输出 Markdown JSON 围栏或其他额外文本。",
       "",
       "## 评审要点",
@@ -1064,6 +1090,20 @@ export class OmpAdapter implements RuntimeAdapter {
       ""
     ];
     return lines.join("\n");
+  }
+
+  /**
+   * 仅在首次输出已被严格 schema 拒绝时使用。它不携带或修改首次模型内容，
+   * 而是要求 Omp 从冻结输入重新做一次独立审查。
+   */
+  private buildReviewFormatRetryPrompt(input: ReviewTaskInput): string {
+    return [
+      this.buildReviewPrompt(input),
+      "## 格式纠正重试",
+      "这是一次新的独立审查。请从上方冻结 Evidence Pack、Diff 和验证结果重新判断，不要引用任何先前回答。",
+      "若存在 finding，每一项都必须包含 category，且其值只能从 compatibility、regression_test、correctness、security、maintainability、other 中逐字选择。",
+      "若无法满足全部 JSON 字段和证据绑定要求，输出 verdict=block 的合法 JSON，而不是省略字段。"
+    ].join("\n");
   }
 }
 
@@ -1303,6 +1343,18 @@ function mapOmpObjectToRuntimeEvent(
     message: `[unknown-event:${type || "no-type"}] ${JSON.stringify(obj).slice(0, 200)}`,
     at
   };
+}
+
+/**
+ * 只识别本地严格 schema 校验生成的失败关闭结果。真实 Reviewer 主动给出的
+ * block（包括 P1）绝不能触发重试，更不能被自动转换为可批准结果。
+ */
+function shouldRetryMalformedReview(result: ReviewResult): boolean {
+  return result.verdict === "block" && result.findings.some((finding) =>
+    finding.priority === "P1" &&
+    finding.category === "other" &&
+    finding.message.startsWith("omp review 输出不符合严格 Review schema：")
+  );
 }
 
 /**
